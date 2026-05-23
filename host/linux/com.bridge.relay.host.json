@@ -1,0 +1,9 @@
+{
+  "name": "com.bridge.relay.host",
+  "description": "Agent Browser Bridge Host (Linux)",
+  "path": "../run-host.sh",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://klpkimhbilkmofmngffifkpiokohbjhk/"
+  ]
+}

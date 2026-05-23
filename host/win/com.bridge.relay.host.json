@@ -1,0 +1,9 @@
+{
+  "name": "com.bridge.relay.host",
+  "description": "Agent Browser Bridge Host (Windows)",
+  "path": "../run-host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://klpkimhbilkmofmngffifkpiokohbjhk/"
+  ]
+}

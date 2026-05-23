@@ -1,0 +1,16 @@
+{
+  "name": "bridge-extension",
+  "version": "1.0.0",
+  "description": "Standalone build for Bridge Extension",
+  "main": "background.js",
+  "scripts": {
+    "build": "node build.js",
+    "type-check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "fs-extra": "^11.3.4",
+    "glob": "^13.0.6",
+    "typescript": "^5.0.0",
+    "@types/chrome": "^0.0.268"
+  }
+}

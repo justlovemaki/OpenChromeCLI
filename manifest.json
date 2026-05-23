@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Open Chrome CLI",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3sZbtcQPJFPjTyAEUpN3ub47qfhKJ9aKQipzTHSxSNBEH1pe9dVkFxduYG+O9X+I5Uq8hWohqCLqs6PxFvK0NZv0MEQ6ONy3xlnRKgqlABg0OToYtG6hC+U4MzOQvUkq2MmxxEDIxgWMXYhCjfD19fCtlMHrGG7Vv+W8YL8ZaRc09vOCR06YWr3GXcEeb+LjUTny+dH4sEwekqqzEp5knuWQrV9Rx/v5hKNA53a5zdpY10mssXC+lEEnVxxBLEifuXScZ5lpPM4hM86Vj7iIvwk2DIpJfWZnWCo005xfKAnPRh/cGaDFTZlhbW3HWQyL0HD+nab4SDmIk42DR0/ACwIDAQAB",
+  "version": "1.0",
+  "description": "连接浏览器与 AI Agent 的桥梁，支持通过 Agent 调试远程浏览器。",
+  "permissions": [
+    "nativeMessaging",
+    "debugger",
+    "tabs",
+    "history",
+    "downloads",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Open Chrome CLI"
+  }
+}
