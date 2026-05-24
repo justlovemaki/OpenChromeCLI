@@ -246,6 +246,7 @@ export class JsonRpcRouter {
 // 具体的 Native Relay 功能 Handler 实现
 export class NativeRelayHandler {
     private extensionInstanceId: string = "";
+    private router: JsonRpcRouter | null = null;
 
     // 定义 RPC 方法的文档元数据
     public readonly _rpcMetadata: Record<string, { description: string, params?: string[] }> = {
@@ -256,6 +257,110 @@ export class NativeRelayHandler {
         createTab: { 
             description: "创建一个新的浏览器标签页", 
             params: ["url: string (可选，默认 google.com)"] 
+        },
+        click: { 
+            description: "根据 UID 点击页面元素（推荐使用，比坐标点击更精准）", 
+            params: ["tabId: number", "uid: string", "dblClick: boolean (可选)"] 
+        },
+        fillForm: {
+            description: "一次性填充多个表单元素（输入框、下拉框等）。比多次调用 click/type 快得多。",
+            params: ["tabId: number", "elements: {uid: string, value: string}[]"]
+        },
+        emulateDevice: {
+            description: "模拟特定设备环境，检查响应式布局或 Googlebot 渲染。",
+            params: ["tabId: number", "profile: 'iphone'|'android'|'googlebot'|'desktop'"]
+        },
+        resizePage: {
+            description: "精确调整页面的窗口视口尺寸（宽x高）。",
+            params: ["tabId: number", "width: number", "height: number"]
+        },
+        listNetworkRequests: {
+            description: "获取当前页面加载的所有网络资源列表，用于分析加载性能和 404 错误。",
+            params: ["tabId: number"]
+        },
+        getCookies: {
+            description: "获取当前页面的 Cookies 信息。",
+            params: ["tabId: number"]
+        },
+        takeFullPageScreenshot: {
+            description: "截取整个页面的长图（包括滚动条下方的隐藏内容）。",
+            params: ["tabId: number", "format: 'png'|'jpeg'", "quality: number"]
+        },
+        pressKey: {
+            description: "模拟物理按键或组合键。例如 'Enter', 'Tab', 'Control+A'。",
+            params: ["tabId: number", "key: string"]
+        },
+        navigatePage: {
+            description: "页面导航控制：前进、后退或刷新。",
+            params: ["tabId: number", "type: 'back'|'forward'|'reload'"]
+        },
+        hover: {
+            description: "悬停在指定 UID 的元素上，触发悬浮菜单或提示。",
+            params: ["tabId: number", "uid: string"]
+        },
+        listConsoleMessages: {
+            description: "获取页面的最近 100 条控制台日志和 JS 错误。",
+            params: ["tabId: number"]
+        },
+        evaluateScript: {
+            description: "在页面中执行自定义 JavaScript 代码并返回结果。",
+            params: ["tabId: number", "script: string"]
+        },
+        drag: {
+            description: "将一个元素拖拽到另一个元素位置。",
+            params: ["tabId: number", "fromUid: string", "toUid: string"]
+        },
+        uploadFile: {
+            description: "为指定的文件输入元素上传文件。",
+            params: ["tabId: number", "uid: string", "filePath: string"]
+        },
+        clickAt: {
+            description: "点击屏幕上的精确坐标位置。",
+            params: ["tabId: number", "x: number", "y: number"]
+        },
+        selectPage: {
+            description: "激活并置顶显示指定的标签页。",
+            params: ["tabId: number"]
+        },
+        closePage: {
+            description: "关闭指定的标签页。",
+            params: ["tabId: number"]
+        },
+        typeText: {
+            description: "模拟真实人类打字速度输入文本。用于绕过简单的机器人检测。",
+            params: ["tabId: number", "text: string"]
+        },
+        handleDialog: {
+            description: "手动处理页面弹出的对话框（alert, confirm, prompt）。",
+            params: ["tabId: number", "action: 'accept'|'dismiss'", "promptText: string (可选)"]
+        },
+        getNetworkResponseBody: {
+            description: "获取指定网络请求的响应正文内容。",
+            params: ["tabId: number", "requestId: string"]
+        },
+        takeHeapSnapshot: {
+            description: "抓取当前页面的堆内存快照并保存到本地文件。用于分析内存泄漏。",
+            params: ["tabId: number", "filePath: string"]
+        },
+        getHeapSnapshotSummary: {
+            description: "获取已保存堆快照文件的摘要分析（需提供文件路径）。",
+            params: ["filePath: string"]
+        },
+        getHeapSnapshotClassNodes: {
+            description: "加载堆快照并返回特定类的所有实例 ID。",
+            params: ["filePath: string", "id: number (类的 ID)", "pageIdx: number", "pageSize: number"]
+        },
+        getHeapSnapshotDetails: {
+            description: "获取堆快照的详细统计信息，包括聚合节点信息。",
+            params: ["filePath: string", "pageIdx: number", "pageSize: number"]
+        },
+        getHeapSnapshotRetainers: {
+            description: "获取特定节点的保留路径（Retainers），分析对象为何未被释放。",
+            params: ["filePath: string", "nodeId: number", "pageIdx: number", "pageSize: number"]
+        },
+        waitFor: {
+            description: "等待页面出现特定文字或 UID 元素。用于处理异步加载。",
+            params: ["tabId: number", "text: string[] (可选，匹配任意一个即可)", "uid: string (可选)", "timeout: number (可选，默认 30000ms)"]
         },
         attach: { 
             description: "为指定标签页附加调试器（CDP）", 
@@ -310,6 +415,10 @@ export class NativeRelayHandler {
         });
     }
 
+    public setRouter(router: JsonRpcRouter) {
+        this.router = router;
+    }
+
     ping() {
         return "pong";
     }
@@ -341,6 +450,146 @@ export class NativeRelayHandler {
                 else resolve({ detached: true });
             });
         });
+    }
+
+    async click(params: { tabId: number; uid: string; dblClick?: boolean }) {
+        if (!params.tabId || !params.uid) throw new Error("Missing tabId or uid");
+        return await Agent.click(params.tabId, params.uid, { dblClick: params.dblClick });
+    }
+
+    async fillForm(params: { tabId: number; elements: { uid: string; value: string }[] }) {
+        if (!params.tabId || !params.elements) throw new Error("Missing tabId or elements");
+        return await Agent.fillForm(params.tabId, params.elements);
+    }
+
+    async emulateDevice(params: { tabId: number; profile: 'iphone' | 'android' | 'googlebot' | 'desktop' }) {
+        if (!params.tabId || !params.profile) throw new Error("Missing tabId or profile");
+        return await Agent.emulateDevice(params.tabId, params.profile);
+    }
+
+    async resizePage(params: { tabId: number; width: number; height: number }) {
+        if (!params.tabId || !params.width || !params.height) throw new Error("Missing params");
+        return await Agent.resizePage(params.tabId, params.width, params.height);
+    }
+
+    async listNetworkRequests(params: { tabId: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.listNetworkRequests(params.tabId);
+    }
+
+    async getCookies(params: { tabId: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.getCookies(params.tabId);
+    }
+
+    async takeFullPageScreenshot(params: { tabId: number; format?: string; quality?: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.takeFullPageScreenshot(params.tabId, params);
+    }
+
+    async pressKey(params: { tabId: number; key: string }) {
+        if (!params.tabId || !params.key) throw new Error("Missing tabId or key");
+        return await Agent.pressKey(params.tabId, params.key);
+    }
+
+    async navigatePage(params: { tabId: number; type: 'back' | 'forward' | 'reload' }) {
+        if (!params.tabId || !params.type) throw new Error("Missing tabId or type");
+        return await Agent.navigatePage(params.tabId, params.type);
+    }
+
+    async hover(params: { tabId: number; uid: string }) {
+        if (!params.tabId || !params.uid) throw new Error("Missing tabId or uid");
+        return await Agent.hover(params.tabId, params.uid);
+    }
+
+    async listConsoleMessages(params: { tabId: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.listConsoleMessages(params.tabId);
+    }
+
+    async evaluateScript(params: { tabId: number; script: string }) {
+        if (!params.tabId || !params.script) throw new Error("Missing tabId or script");
+        return await Agent.evaluateScript(params.tabId, params.script);
+    }
+
+    async drag(params: { tabId: number; fromUid: string; toUid: string }) {
+        if (!params.tabId || !params.fromUid || !params.toUid) throw new Error("Missing params");
+        return await Agent.drag(params.tabId, params.fromUid, params.toUid);
+    }
+
+    async uploadFile(params: { tabId: number; uid: string; filePath: string }) {
+        if (!params.tabId || !params.uid || !params.filePath) throw new Error("Missing params");
+        return await Agent.uploadFile(params.tabId, params.uid, params.filePath);
+    }
+
+    async clickAt(params: { tabId: number; x: number; y: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.clickAt(params.tabId, params.x, params.y);
+    }
+
+    async selectPage(params: { tabId: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.selectPage(params.tabId);
+    }
+
+    async closePage(params: { tabId: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.closePage(params.tabId);
+    }
+
+    async typeText(params: { tabId: number; text: string }) {
+        if (!params.tabId || !params.text) throw new Error("Missing params");
+        return await Agent.typeText(params.tabId, params.text);
+    }
+
+    async handleDialog(params: { tabId: number; action: 'accept' | 'dismiss'; promptText?: string }) {
+        if (!params.tabId || !params.action) throw new Error("Missing params");
+        return await Agent.handleDialog(params.tabId, params.action, params.promptText);
+    }
+
+    async getNetworkResponseBody(params: { tabId: number; requestId: string }) {
+        if (!params.tabId || !params.requestId) throw new Error("Missing params");
+        return await Agent.getNetworkResponseBody(params.tabId, params.requestId);
+    }
+
+    async takeHeapSnapshot(params: { tabId: number; filePath: string }) {
+        if (!params.tabId || !params.filePath) throw new Error("Missing params");
+        
+        // 这是一个流式操作。我们需要通过 Notification 通知 Host 开启文件写入
+        this.router?.sendNotification("onStartHeapSnapshot", { filePath: params.filePath });
+        
+        const result = await Agent.takeHeapSnapshot(params.tabId, (chunk: string) => {
+            this.router?.sendNotification("onHeapSnapshotChunk", { chunk });
+        });
+
+        this.router?.sendNotification("onEndHeapSnapshot", { filePath: params.filePath });
+        return result;
+    }
+
+    async getHeapSnapshotSummary(params: { filePath: string }) {
+        // 这个操作由 Native Host 端实现更合适，因为需要解析大 JSON
+        if (!this.router) throw new Error("Router not initialized");
+        return await this.router.sendRequest("host.getHeapSnapshotSummary", params);
+    }
+
+    async getHeapSnapshotClassNodes(params: { filePath: string; id: number; pageIdx?: number; pageSize?: number }) {
+        if (!this.router) throw new Error("Router not initialized");
+        return await this.router.sendRequest("host.getHeapSnapshotClassNodes", params);
+    }
+
+    async getHeapSnapshotDetails(params: { filePath: string; pageIdx?: number; pageSize?: number }) {
+        if (!this.router) throw new Error("Router not initialized");
+        return await this.router.sendRequest("host.getHeapSnapshotDetails", params);
+    }
+
+    async getHeapSnapshotRetainers(params: { filePath: string; nodeId: number; pageIdx?: number; pageSize?: number }) {
+        if (!this.router) throw new Error("Router not initialized");
+        return await this.router.sendRequest("host.getHeapSnapshotRetainers", params);
+    }
+
+    async waitFor(params: { tabId: number; text?: string[]; uid?: string; timeout?: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await Agent.waitFor(params.tabId, { text: params.text, uid: params.uid, timeout: params.timeout });
     }
 
     async executeCdp(params: { tabId: number; method: string; params: any }) {
@@ -453,6 +702,7 @@ export class NativeRelayExtension extends JsonRpcRouter {
         super(transport);
         this.transportInstance = transport;
         const handler = new NativeRelayHandler();
+        handler.setRouter(this);
         
         // 覆盖默认的 restartRelay 以执行实际的重启
         const originalRestart = handler.restartRelay.bind(handler);
