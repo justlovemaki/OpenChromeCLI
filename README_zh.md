@@ -1,5 +1,7 @@
 # Open Chrome CLI (Agent Browser Bridge)
 
+中文版 | [English](./README.md)
+
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Chrome%20%7C%20Edge%20%7C%20Brave-orange.svg)](#)
 
