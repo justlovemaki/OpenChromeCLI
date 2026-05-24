@@ -8,7 +8,7 @@ setTimeout(() => {
     nativeRelay = new NativeRelayExtension("com.bridge.relay.host");
     (nativeRelay as any).transportInstance.connect();
     console.log("Agent Browser Bridge initialized");
-}, 1000);
+}, 3500);
 
 // Forward CDP events to relay
 chrome.debugger.onEvent.addListener((source, method, params) => {

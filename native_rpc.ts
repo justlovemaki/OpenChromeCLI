@@ -253,7 +253,6 @@ export class NativeRelayHandler {
         ping: { description: "测试连接，返回 'pong'" },
         getInfo: { description: "获取浏览器扩展程序的详细信息" },
         getTabs: { description: "获取当前所有打开的标签页列表" },
-        getUserTabs: { description: "获取用户标签页列表（与 getTabs 相同）" },
         createTab: { 
             description: "创建一个新的浏览器标签页", 
             params: ["url: string (可选，默认 google.com)"] 
@@ -281,10 +280,6 @@ export class NativeRelayHandler {
         getCookies: {
             description: "获取当前页面的 Cookies 信息。",
             params: ["tabId: number"]
-        },
-        takeFullPageScreenshot: {
-            description: "截取整个页面的长图（包括滚动条下方的隐藏内容）。",
-            params: ["tabId: number", "format: 'png'|'jpeg'", "quality: number"]
         },
         pressKey: {
             description: "模拟物理按键或组合键。例如 'Enter', 'Tab', 'Control+A'。",
@@ -376,7 +371,7 @@ export class NativeRelayHandler {
         },
         takeScreenshot: { 
             description: "对指定标签页进行截图（基于 CDP）", 
-            params: ["tabId: number", "format: 'png'|'jpeg' (默认 png)", "quality: number (0-100)"] 
+            params: ["tabId: number", "format: 'png'|'jpeg' (默认 png)", "quality: number (0-100)", "fullPage: boolean (可选)"] 
         },
         moveMouse: { 
             description: "控制鼠标在页面上的移动", 
@@ -385,10 +380,6 @@ export class NativeRelayHandler {
         getUserHistory: { 
             description: "搜索用户的浏览器历史记录", 
             params: ["text: string (搜索关键词)", "maxResults: number (默认 100)"] 
-        },
-        claimUserTab: { 
-            description: "接管现有用户标签页并自动 attach", 
-            params: ["tabId: number"] 
         },
         finalizeTabs: { 
             description: "关闭除了指定 ID 以外的所有标签页", 
@@ -480,11 +471,6 @@ export class NativeRelayHandler {
     async getCookies(params: { tabId: number }) {
         if (!params.tabId) throw new Error("Missing tabId");
         return await Agent.getCookies(params.tabId);
-    }
-
-    async takeFullPageScreenshot(params: { tabId: number; format?: string; quality?: number }) {
-        if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.takeFullPageScreenshot(params.tabId, params);
     }
 
     async pressKey(params: { tabId: number; key: string }) {
@@ -608,10 +594,6 @@ export class NativeRelayHandler {
         }));
     }
 
-    async getUserTabs() {
-        return await this.getTabs();
-    }
-
     async getUserHistory(params: { text?: string; maxResults?: number }) {
         return new Promise((resolve) => {
             chrome.history.search({
@@ -621,12 +603,6 @@ export class NativeRelayHandler {
                 resolve(results);
             });
         });
-    }
-
-    async claimUserTab(params: { tabId: number }) {
-        if (!params.tabId) throw new Error("Missing tabId");
-        await Agent.ensureDebuggerAttached(params.tabId);
-        return { claimed: true, tabId: params.tabId };
     }
 
     async createTab(params?: { url?: string }) {
@@ -645,8 +621,13 @@ export class NativeRelayHandler {
         return { success: true };
     }
 
-    async takeScreenshot(params: { tabId: number; format?: string; quality?: number }) {
+    async takeScreenshot(params: { tabId: number; format?: string; quality?: number; fullPage?: boolean }) {
         if (!params.tabId) throw new Error("Missing tabId");
+        
+        if (params.fullPage) {
+            return await Agent.takeFullPageScreenshot(params.tabId, params);
+        }
+
         // CDP screenshot is more powerful
         const result = await Agent.sendCDP(params.tabId, "Page.captureScreenshot", {
             format: params.format || "png",

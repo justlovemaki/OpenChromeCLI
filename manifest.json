@@ -10,7 +10,22 @@
     "tabs",
     "history",
     "downloads",
-    "storage"
+    "storage",
+    "scripting"
+  ],
+  "web_accessible_resources": [
+    {
+      "matches": ["<all_urls>"],
+      "resources": ["icons/cursor-chat.png"]
+    }
+  ],
+  "content_scripts": [
+    {
+      "js": ["content.js"],
+      "matches": ["<all_urls>"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
   ],
   "background": {
     "service_worker": "background.js",

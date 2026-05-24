@@ -78,11 +78,11 @@ export const Agent: any = {
                 this.debuggerSessions[tabId] = { attached: true, attaching: null, lastUsed: Date.now() };
                 
                 // Enable Page domain to receive dialog events
-                chrome.debugger.sendCommand({ tabId: tabId }, "Page.enable", {}, () => {});
+                chrome.debugger.sendCommand({ tabId: tabId }, "Page.enable", {}, () => { chrome.runtime.lastError; });
                 // 开启日志和运行时域
-                chrome.debugger.sendCommand({ tabId: tabId }, "Log.enable", {}, () => {});
-                chrome.debugger.sendCommand({ tabId: tabId }, "Runtime.enable", {}, () => {});
-                chrome.debugger.sendCommand({ tabId: tabId }, "HeapProfiler.enable", {}, () => {});
+                chrome.debugger.sendCommand({ tabId: tabId }, "Log.enable", {}, () => { chrome.runtime.lastError; });
+                chrome.debugger.sendCommand({ tabId: tabId }, "Runtime.enable", {}, () => { chrome.runtime.lastError; });
+                chrome.debugger.sendCommand({ tabId: tabId }, "HeapProfiler.enable", {}, () => { chrome.runtime.lastError; });
 
                 if (!this._debuggerListenerAdded) {
                     chrome.debugger.onDetach.addListener((source, reason) => {
@@ -355,110 +355,179 @@ export const Agent: any = {
      */
     async showVisualAction(tabId, pos, type = 'click') {
         if (!pos || pos.x === undefined || pos.y === undefined) return;
-        const color = this.config.primaryColor || '16,185,129';
+        const { x, y } = pos;
+        
         try {
-            await this.executeScript(tabId, {
-                func: (x, y, t, c) => {
-                    const containerId = 'ai-visual-feedback-container';
-                    let container = document.getElementById(containerId);
-                    if (!container) {
-                        container = document.createElement('div');
-                        container.id = containerId;
-                        container.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';
-                        document.documentElement.appendChild(container);
-                    }
-                    const ripple = document.createElement('div');
-                    ripple.style.cssText = `
-                        position:absolute;left:${x}px;top:${y}px;width:40px;height:40px;margin-left:-20px;margin-top:-20px;
-                        border-radius:50%;background-color:${t === 'click' ? 'rgba(239, 68, 68, 0.4)' : `rgba(${c}, 0.4)`};
-                        border:2px solid white;box-shadow:0 0 15px rgba(0,0,0,0.2);
-                        transition:all 0.8s cubic-bezier(0.23, 1, 0.32, 1);transform:scale(0.1);opacity:1;
-                    `;
-                    container.appendChild(ripple);
-                    ripple.offsetTop;
-                    ripple.style.transform = 'scale(2)'; ripple.style.opacity = '0';
-                    setTimeout(() => ripple.remove(), 800);
-                },
-                args: [pos.x, pos.y, type, color]
+            // 优先使用 Content Script 消息，支持复杂的 CSS 动效和主题色
+            await chrome.tabs.sendMessage(tabId, {
+                type: "SHOW_VISUAL_ACTION",
+                x, y,
+                actionType: type
             });
-        } catch (e) {}
+        } catch (e) {
+            // 如果 Content Script 尚未加载或连接断开，回退到原生注入
+            try {
+                await this.executeScript(tabId, {
+                    func: (x, y) => {
+                        const containerId = 'ai-visual-feedback-container';
+                        let container = document.getElementById(containerId);
+                        if (!container) {
+                            container = document.createElement('div');
+                            container.id = containerId;
+                            container.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';
+                            document.documentElement.appendChild(container);
+                        }
+                        const ripple = document.createElement('div');
+                        // 统一使用翡翠绿主题色
+                        ripple.style.cssText = `
+                            position:absolute;left:${x}px;top:${y}px;width:40px;height:40px;margin-left:-20px;margin-top:-20px;
+                            border-radius:50%;background-color:rgba(16, 185, 129, 0.4);
+                            border:2px solid white;box-shadow:0 0 15px rgba(16, 185, 129, 0.3);
+                            transition:all 0.8s cubic-bezier(0.23, 1, 0.32, 1);transform:scale(0.1);opacity:1;
+                        `;
+                        container.appendChild(ripple);
+                        ripple.offsetTop; // 触发重绘
+                        ripple.style.transform = 'scale(2.5)'; ripple.style.opacity = '0';
+                        setTimeout(() => ripple.remove(), 1000);
+                    },
+                    args: [x, y]
+                });
+            } catch (innerErr) {}
+        }
     },
 
     /**
      * 根据 UID 点击页面元素
      */
     async click(tabId: number, uid: string, options: { dblClick?: boolean } = {}) {
-        const cache = this.refMetaCache[tabId];
-        if (!cache || !cache.refMeta || !cache.refMeta[uid]) {
-            throw new Error(`Element with UID "${uid}" not found in current page cache. Please run readPage first.`);
+        // 1. 备份旧的元数据，用于跨刷新找回
+        const oldCache = this.refMetaCache[tabId];
+        const oldMeta = oldCache?.refMeta?.[uid];
+
+        // 2. 自动刷新一次页面状态，确保 UID 是最新的且坐标准确
+        try {
+            await this.readPage(tabId, "interactive", 15);
+        } catch (e) {
+            console.warn("Refresh failed before click:", e.message);
         }
 
-        const meta = cache.refMeta[uid];
-        // 计算中心点坐标
-        const x = Math.round(meta.x + meta.width / 2);
-        const y = Math.round(meta.y + meta.height / 2);
+        const cache = this.refMetaCache[tabId];
+        const meta = cache?.refMeta?.[uid];
 
-        // 1. 显示视觉反馈（红圈涟漪）
+        if (!meta) {
+            // 3. 降级方案：尝试通过保存的指纹 (Fingerprint) 进行匹配点击
+            console.log(`UID ${uid} not found in cache after refresh, attempting advanced JS fingerprinting click...`);
+            try {
+                const jsResult = await this.executeScript(tabId, {
+                    func: (u, a, m) => (window as any).__clickUID?.(u, a, m),
+                    args: [uid, "click", oldMeta]
+                });
+                if (jsResult?.[0]?.result?.success) return { success: true, method: "js-fingerprint" };
+            } catch (jsErr) {
+                console.warn("Fingerprint click failed:", jsErr.message);
+            }
+            throw new Error(`Element with UID "${uid}" could not be resolved or matched after refresh.`);
+        }
+
+        // 计算中心点坐标
+        let x = Math.round(meta.x + meta.width / 2);
+        let y = Math.round(meta.y + meta.height / 2);
+
+        // 如果坐标无效 (NaN)，尝试通过 JS 实时获取
+        if (isNaN(x) || isNaN(y)) {
+            const rectResult = await this.executeScript(tabId, {
+                func: (u) => {
+                    const el = (window as any).__claudeResolveElement?.(u);
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return { x: r.left, y: r.top, width: r.width, height: r.height };
+                },
+                args: [uid]
+            });
+            const rect = rectResult?.[0]?.result;
+            if (rect) {
+                x = Math.round(rect.x + rect.width / 2);
+                y = Math.round(rect.y + rect.height / 2);
+            }
+        }
+
+        if (isNaN(x) || isNaN(y)) {
+            throw new Error(`Could not determine valid coordinates for UID "${uid}".`);
+        }
+
+        // 1. 显示视觉反馈
         await this.showVisualAction(tabId, { x, y }, 'click');
 
         // 2. 执行物理点击 (按下 + 抬起)
         const clickCount = options.dblClick ? 2 : 1;
         
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
-            type: "mousePressed",
-            x, y,
-            button: "left",
-            clickCount
-        });
+        try {
+            await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
+                type: "mousePressed", x, y, button: "left", clickCount
+            });
+            await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
+                type: "mouseReleased", x, y, button: "left", clickCount
+            });
+            return { success: true, x, y, method: "cdp" };
+        } catch (cdpErr) {
+            // CDP 失败时，最后尝试一次 JS 点击
+            const jsResult = await this.executeScript(tabId, {
+                func: (u, a, m) => (window as any).__clickUID?.(u, a, m),
+                args: [uid, "click", meta]
+            });
+            return { success: jsResult?.[0]?.result?.success, method: "js-final-fallback" };
+        }
 
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
-            type: "mouseReleased",
-            x, y,
-            button: "left",
-            clickCount
-        });
-
-        return { success: true, x, y };
     },
 
     /**
-     * 等待页面出现特定文字或元素
+     * 等待页面出现特定文字或元素 (引擎对齐版)
      */
-    async waitFor(tabId: number, options: { text?: string[]; uid?: string; timeout?: number }) {
+    async waitFor(tabId: number, options: { text?: string | string[]; uid?: string; timeout?: number }) {
         const timeout = options.timeout || 30000;
         const start = Date.now();
         const interval = 1000;
+        
+        // 1. 参数标准化 (强制转为数组)
+        const targetTexts = options.text 
+            ? (Array.isArray(options.text) ? options.text : [options.text])
+            : [];
+        const normalize = (s) => String(s || "").toLowerCase().replace(/\s+/g, ' ').trim();
+        const normalizedTargets = targetTexts.map(normalize);
 
         while (Date.now() - start < timeout) {
-            // 如果是等待文字
-            if (options.text && options.text.length > 0) {
-                try {
-                    const results = await this.executeScript(tabId, {
-                        func: (ts) => {
-                            const bodyText = document.body.innerText;
-                            return ts.some(t => bodyText.includes(t));
-                        },
-                        args: [options.text]
-                    });
-                    if (results?.[0]?.result) return { success: true, found: "text" };
-                } catch (e) {}
-            }
+            if (!(await this.getTabState(tabId))) throw new Error("Tab closed during wait.");
 
-            // 如果是等待 UID 对应的元素（通常用于等待某个按钮加载出来）
-            if (options.uid) {
-                try {
-                    // 重新运行一次轻量级 readPage 检查
-                    const result = await this.readPage(tabId, "interactive", 10);
-                    if (result && result.refMeta && result.refMeta[options.uid]) {
+            try {
+                // 2. 复用 readPage 的核心引擎进行快照抓取
+                // 深度设为 10 即可，保证效率
+                const snapshot = await this.readPage(tabId, "all", 10);
+                
+                if (snapshot && !snapshot.error) {
+                    // A. 检查页面内容 (对齐 read_page 的输出)
+                    if (normalizedTargets.length > 0) {
+                        const pageContent = normalize(snapshot.pageContent || "");
+                        const seoText = normalize(JSON.stringify(snapshot.seoInfo || {}));
+                        const combinedText = pageContent + " " + seoText;
+                        
+                        if (normalizedTargets.some(t => combinedText.includes(t))) {
+                            return { success: true, found: "text" };
+                        }
+                    }
+
+                    // B. 检查 UID
+                    if (options.uid && snapshot.refMeta && snapshot.refMeta[options.uid]) {
                         return { success: true, found: "element" };
                     }
-                } catch (e) {}
+                }
+            } catch (e) {
+                console.warn("Wait polling encountered error, retrying...", e.message);
             }
 
             await new Promise(r => setTimeout(r, interval));
         }
 
-        throw new Error(`Wait timeout after ${timeout}ms`);
+        throw new Error(`Wait timeout after ${timeout}ms. Targets: ${JSON.stringify(targetTexts)}, UID: ${options.uid}`);
     },
 
     /**
@@ -578,35 +647,77 @@ export const Agent: any = {
     },
 
     /**
-     * 物理按键模拟 (支持组合键)
+     * 物理按键模拟 (支持组合键，如 "Control+A", "Enter")
      */
     async pressKey(tabId: number, key: string) {
-        // 处理组合键，如 "Control+A"
-        const modifiers = {
-            Control: 2, Alt: 1, Shift: 8, Meta: 4
+        const keyMap: Record<string, { code: string; vkc: number; text?: string }> = {
+            "Enter": { code: "Enter", vkc: 13, text: "\r" },
+            "Tab": { code: "Tab", vkc: 9 },
+            "Escape": { code: "Escape", vkc: 27 },
+            "Backspace": { code: "Backspace", vkc: 8 },
+            "Delete": { code: "Delete", vkc: 46 },
+            "Space": { code: "Space", vkc: 32, text: " " },
+            "ArrowLeft": { code: "ArrowLeft", vkc: 37 },
+            "ArrowUp": { code: "ArrowUp", vkc: 38 },
+            "ArrowRight": { code: "ArrowRight", vkc: 39 },
+            "ArrowDown": { code: "ArrowDown", vkc: 40 },
+            "PageUp": { code: "PageUp", vkc: 33 },
+            "PageDown": { code: "PageDown", vkc: 34 },
+            "End": { code: "End", vkc: 35 },
+            "Home": { code: "Home", vkc: 36 },
+            "Insert": { code: "Insert", vkc: 45 }
         };
+
+        const modifiersMap = { Control: 2, Alt: 1, Shift: 8, Meta: 4 };
         let currentModifiers = 0;
         let mainKey = key;
 
+        // 解析组合键
         if (key.includes('+')) {
             const parts = key.split('+');
             mainKey = parts.pop()!;
             parts.forEach(p => {
-                if (modifiers[p]) currentModifiers |= modifiers[p];
+                if ((modifiersMap as any)[p]) currentModifiers |= (modifiersMap as any)[p];
             });
         }
 
+        const keyInfo = keyMap[mainKey] || {
+            code: mainKey.length === 1 ? `Key${mainKey.toUpperCase()}` : mainKey,
+            vkc: mainKey.length === 1 ? mainKey.toUpperCase().charCodeAt(0) : 0,
+            text: mainKey.length === 1 ? mainKey : undefined
+        };
+
+        const commonParams = {
+            modifiers: currentModifiers,
+            windowsVirtualKeyCode: keyInfo.vkc,
+            code: keyInfo.code,
+            key: mainKey
+        };
+
+        // 1. 发送按下事件
         await this.sendCDP(tabId, "Input.dispatchKeyEvent", {
             type: "keyDown",
-            modifiers: currentModifiers,
-            key: mainKey,
-            windowsVirtualKeyCode: mainKey.length === 1 ? mainKey.toUpperCase().charCodeAt(0) : undefined
+            ...commonParams,
+            text: keyInfo.text,
+            unmodifiedText: keyInfo.text
         });
+
+        // 2. 如果是字符或 Enter，通常需要发送 char 事件来触发某些网页逻辑
+        if (keyInfo.text) {
+            await this.sendCDP(tabId, "Input.dispatchKeyEvent", {
+                type: "char",
+                ...commonParams,
+                text: keyInfo.text,
+                unmodifiedText: keyInfo.text
+            });
+        }
+
+        // 3. 发送抬起事件
         await this.sendCDP(tabId, "Input.dispatchKeyEvent", {
             type: "keyUp",
-            modifiers: currentModifiers,
-            key: mainKey
+            ...commonParams
         });
+
         return { success: true };
     },
 
@@ -628,13 +739,55 @@ export const Agent: any = {
      * 悬停在指定元素上
      */
     async hover(tabId: number, uid: string) {
+        // 1. 备份旧的元数据
+        const oldCache = this.refMetaCache[tabId];
+        const oldMeta = oldCache?.refMeta?.[uid];
+
+        // 2. 自动刷新一次页面状态
+        try {
+            await this.readPage(tabId, "interactive", 15);
+        } catch (e) {}
+
         const cache = this.refMetaCache[tabId];
-        if (!cache || !cache.refMeta || !cache.refMeta[uid]) {
-            throw new Error(`Element with UID "${uid}" not found. Run readPage first.`);
+        const meta = cache?.refMeta?.[uid];
+        
+        if (!meta) {
+            console.log(`UID ${uid} not found in cache for hover, attempting fingerprint hover...`);
+            try {
+                const jsResult = await this.executeScript(tabId, {
+                    func: (u, a, m) => (window as any).__clickUID?.(u, a, m),
+                    args: [uid, "hover", oldMeta]
+                });
+                if (jsResult?.[0]?.result?.success) return { success: true, method: "js-fingerprint" };
+            } catch (e) {}
+            throw new Error(`Element with UID "${uid}" could not be resolved for hover after refresh.`);
         }
-        const meta = cache.refMeta[uid];
-        const x = Math.round(meta.x + meta.width / 2);
-        const y = Math.round(meta.y + meta.height / 2);
+
+        // 确保坐标有效
+        let x = Math.round(meta.x + meta.width / 2);
+        let y = Math.round(meta.y + meta.height / 2);
+
+        // 如果坐标无效 (NaN)，尝试通过 JS 实时获取
+        if (isNaN(x) || isNaN(y)) {
+            const rectResult = await this.executeScript(tabId, {
+                func: (u) => {
+                    const el = (window as any).__claudeResolveElement?.(u);
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    return { x: r.left, y: r.top, width: r.width, height: r.height };
+                },
+                args: [uid]
+            });
+            const rect = rectResult?.[0]?.result;
+            if (rect) {
+                x = Math.round(rect.x + rect.width / 2);
+                y = Math.round(rect.y + rect.height / 2);
+            }
+        }
+
+        if (isNaN(x) || isNaN(y)) {
+            throw new Error(`Could not determine valid coordinates for UID "${uid}".`);
+        }
 
         await this.showVisualAction(tabId, { x, y }, 'hover');
         await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
@@ -676,9 +829,12 @@ export const Agent: any = {
      * 将一个元素拖拽到另一个元素
      */
     async drag(tabId: number, fromUid: string, toUid: string) {
+        // 自动刷新一次页面状态
+        await this.readPage(tabId, "interactive", 15);
+
         const cache = this.refMetaCache[tabId];
         if (!cache || !cache.refMeta || !cache.refMeta[fromUid] || !cache.refMeta[toUid]) {
-            throw new Error("UID not found in cache. Run readPage first.");
+            throw new Error("UID not found in cache after refresh.");
         }
         const from = cache.refMeta[fromUid];
         const to = cache.refMeta[toUid];
@@ -701,12 +857,15 @@ export const Agent: any = {
      * 物理上传文件
      */
     async uploadFile(tabId: number, uid: string, filePath: string) {
+        // 自动刷新一次页面状态
+        await this.readPage(tabId, "interactive", 15);
+
         // 首先需要获取 DOM 节点的 nodeId
         // 注意：这是一个高级操作，需要 CDP 的 DOM 域支持
         await this.sendCDP(tabId, "DOM.enable", {});
         const cache = this.refMetaCache[tabId];
         const meta = cache?.refMeta?.[uid];
-        if (!meta) throw new Error("UID not found");
+        if (!meta) throw new Error("UID not found after refresh");
 
         // 通过坐标寻找后端节点 ID
         const { node } = await this.sendCDP(tabId, "DOM.getNodeForLocation", { x: Math.round(meta.x), y: Math.round(meta.y) });
@@ -759,25 +918,25 @@ export const Agent: any = {
     },
 
     /**
-     * 手动处理弹窗
+     * 手动处理弹窗 (Alert/Confirm/Prompt)
      */
     async handleDialog(tabId: number, action: 'accept' | 'dismiss', promptText?: string) {
         await this.ensureDebuggerAttached(tabId);
         const sess = this.debuggerSessions[tabId];
-        // 开启手动模式
-        sess.manualDialogHandling = true;
+        // 开启手动模式，防止被默认的自动接受逻辑干扰
+        if (sess) sess.manualDialogHandling = true;
         
         await this.sendCDP(tabId, "Page.handleJavaScriptDialog", {
             accept: action === 'accept',
             promptText: promptText
         });
         
-        delete sess.pendingDialog;
+        if (sess) delete sess.pendingDialog;
         return { success: true };
     },
 
     /**
-     * 获取特定网络请求的响应体 (查看 API 返回数据)
+     * 获取特定网络请求的响应正文内容 (查看 API 返回数据)
      */
     async getNetworkResponseBody(tabId: number, requestId: string) {
         await this.ensureDebuggerAttached(tabId);
@@ -804,18 +963,21 @@ export const Agent: any = {
         return { success: true };
     },
 
-    async readPage(tabId, filter = "all", depth = 30, ref_id = null) {
+    async readPage(tabId, filter = "all", depth = 30) {
         // === 引擎 A：前台 JS 递归引擎 (优先使用，完美攻克小红书等高防网页) ===
         try {
             if (await this.isTabScriptable(tabId)) {
                 const checkRes = await this.executeScript(tabId, { func: () => typeof window.__generateAccessibilityTree === "function" });
                 if (!checkRes?.[0]?.result) {
-                    await this.executeScript(tabId, { files: ["content.js"] });
+                    const manifest = chrome.runtime.getManifest();
+                    const contentPath = (manifest.name.includes("SEO Master") || manifest.name.includes("SEO助手"))
+                        ? "bridge/content.js" 
+                        : "content.js";
+                    await this.executeScript(tabId, { files: [contentPath] });
                 }
-                const safeRefId = ref_id ? this.normalizeRefId(ref_id) : null;
                 const results = await this.executeScript(tabId, {
-                    func: (f, d, r) => window.__generateAccessibilityTree?.(f, d, r),
-                    args: [filter, depth, safeRefId]
+                    func: (f, d) => window.__generateAccessibilityTree?.(f, d),
+                    args: [filter, depth]
                 });
                 const result = results?.[0]?.result;
                 if (result && !result.error) {

@@ -27,6 +27,7 @@ async function build() {
     const assets = [
         'manifest.json',
         'popup.html',
+        'icons/**',
         'host/**',
         'skills/**',
         'LICENSE',
