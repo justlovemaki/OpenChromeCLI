@@ -810,19 +810,66 @@ export const Agent: any = {
      * 执行任意 JavaScript 代码
      */
     async evaluateScript(tabId: number, script: string) {
-        const results = await this.executeScript(tabId, {
-            func: (code) => {
-                try {
-                    // 使用 eval 或 Function 来执行动态代码
-                    const fn = new Function(code);
-                    return { success: true, result: fn() };
-                } catch (e: any) {
-                    return { success: false, error: e.message };
+        const tab = await this.getTabState(tabId);
+        const isRestricted = this.isRestrictedUrl(tab?.url || "");
+
+        if (!isRestricted) {
+            // 普通页面直接且仅通过 CDP 运行，绕过页面的 CSP 限制并返回完整真实对象，坚决不降级
+            try {
+                const evaluate = (expression: string) => this.sendCDP(tabId, "Runtime.evaluate", {
+                    expression,
+                    returnByValue: true,
+                    awaitPromise: true,
+                    userGesture: true
+                });
+
+                let res = await evaluate(script);
+                const errorText = res.exceptionDetails?.exception?.description || res.exceptionDetails?.text || "";
+                if (res.exceptionDetails && /Illegal return statement|await is only valid|Unexpected reserved word/.test(errorText)) {
+                    res = await evaluate(`(async () => {
+                        ${script}
+                    })()`);
                 }
-            },
-            args: [script]
-        });
-        return results?.[0]?.result;
+
+                if (res.exceptionDetails) {
+                    return { 
+                        success: false, 
+                        error: res.exceptionDetails.exception?.description || res.exceptionDetails.text 
+                    };
+                }
+                return { success: true, result: res.result?.value };
+            } catch (cdpErr: any) {
+                return { success: false, error: `CDP evaluation failed: ${cdpErr.message}` };
+            }
+        }
+
+        // 仅在受限页面（如 chrome-extension:// 页面）下降级回退到页面注入执行
+        try {
+            const results = await this.executeScript(tabId, {
+                func: async (code) => {
+                    const shouldWrap = (message: string) => /Illegal return statement|await is only valid|Unexpected reserved word/.test(message);
+                    try {
+                        return { success: true, result: (0, eval)(code) };
+                    } catch (e: any) {
+                        if (!shouldWrap(e.message || "")) {
+                            return { success: false, error: e.message };
+                        }
+                        try {
+                            const fn = new Function(`return (async () => {
+                                ${code}
+                            })()`);
+                            return { success: true, result: await fn() };
+                        } catch (wrappedErr: any) {
+                            return { success: false, error: wrappedErr.message };
+                        }
+                    }
+                },
+                args: [script]
+            });
+            return results?.[0]?.result;
+        } catch (fallbackErr: any) {
+            return { success: false, error: fallbackErr.message };
+        }
     },
 
     /**
@@ -1084,5 +1131,44 @@ export const Agent: any = {
                 args: [show, color]
             });
         } catch (e) {}
+    },
+
+    async createTab(url: string, groupName: string) {
+        const tab = await chrome.tabs.create({ url });
+        if (tab.id) {
+            try {
+                await this.groupTab(tab.id, groupName);
+            } catch (e) {
+                console.warn("Failed to group tab:", e);
+            }
+        }
+        return tab;
+    },
+
+    async groupTab(tabId: number, groupName: string) {
+        try {
+            const tab = await chrome.tabs.get(tabId);
+            const windowId = tab.windowId;
+            const groups = await chrome.tabGroups.query({ title: groupName, windowId });
+            
+            let groupId: number;
+            if (groups.length > 0) {
+                groupId = groups[0].id;
+                await chrome.tabs.group({ tabIds: [tabId], groupId });
+            } else {
+                groupId = await chrome.tabs.group({ tabIds: [tabId] });
+                const colors = ["blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
+                let hash = 0;
+                for (let i = 0; i < groupName.length; i++) {
+                    hash = groupName.charCodeAt(i) + ((hash << 5) - hash);
+                }
+                const color = colors[Math.abs(hash) % colors.length];
+                await chrome.tabGroups.update(groupId, { title: groupName, color: color as any });
+            }
+            return groupId;
+        } catch (e) {
+            console.error("Error in groupTab:", e);
+            return null;
+        }
     }
 };

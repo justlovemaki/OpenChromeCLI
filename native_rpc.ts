@@ -247,6 +247,7 @@ export class JsonRpcRouter {
 export class NativeRelayHandler {
     private extensionInstanceId: string = "";
     private router: JsonRpcRouter | null = null;
+    private currentGroupName: string | null = null;
 
     // 定义 RPC 方法的文档元数据
     public readonly _rpcMetadata: Record<string, { description: string, params?: string[] }> = {
@@ -254,8 +255,8 @@ export class NativeRelayHandler {
         getInfo: { description: "获取浏览器扩展程序的详细信息" },
         getTabs: { description: "获取当前所有打开的标签页列表" },
         createTab: { 
-            description: "创建一个新的浏览器标签页", 
-            params: ["url: string (可选，默认 google.com)"] 
+            description: "创建一个新的浏览器标签页，并强制将其自动放入对应的标签分组中进行分类隔离", 
+            params: ["url: string (必填，默认 google.com)", "group: string (必填，自定义分组名称。若不传则自动关联当前会话名称进行分组)"] 
         },
         click: { 
             description: "根据 UID 点击页面元素（推荐使用，比坐标点击更精准）", 
@@ -605,9 +606,10 @@ export class NativeRelayHandler {
         });
     }
 
-    async createTab(params?: { url?: string }) {
+    async createTab(params?: { url?: string; group?: string }) {
         const url = params?.url || "https://www.google.com";
-        const tab = await chrome.tabs.create({ url });
+        const groupName = params?.group || this.currentGroupName || "CLI Session";
+        const tab = await Agent.createTab(url, groupName);
         return { id: tab.id, url: tab.url };
     }
 
@@ -638,6 +640,7 @@ export class NativeRelayHandler {
     }
 
     async nameSession(params: { name: string }) {
+        this.currentGroupName = params.name || null;
         return { success: true, name: params.name };
     }
 

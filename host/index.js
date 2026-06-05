@@ -20,7 +20,8 @@ try {
     // 加载失败则保持默认
 }
 
-let externalSocket = null;
+const authenticatedSockets = new Set();
+const pendingRequests = new Map(); // id -> socket
 let stdinBuffer = Buffer.alloc(0);
 let chromeConnected = true;
 
@@ -32,7 +33,7 @@ function log(msg) {
 
 function checkExitConditions() {
     // 如果 Chrome 已断开，且没有外部 CLI 连接，则退出
-    if (!chromeConnected && !externalSocket) {
+    if (!chromeConnected && authenticatedSockets.size === 0) {
         log('No Chrome and no active CLI, exiting...');
         // 给日志留一点写入时间
         setTimeout(() => process.exit(0), 100);
@@ -49,7 +50,7 @@ const server = net.createServer((socket) => {
             if (!socket.isAuthenticated) {
                 if (raw === SECRET_TOKEN) {
                     socket.isAuthenticated = true;
-                    externalSocket = socket;
+                    authenticatedSockets.add(socket);
                     socket.write(JSON.stringify({ status: 'authenticated' }) + '\n');
                     log(`Auth Success: ${socket.remoteAddress}`);
                 } else {
@@ -77,6 +78,9 @@ const server = net.createServer((socket) => {
                 socket.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: "ok" }) + '\n');
                 setTimeout(() => process.exit(0), 100);
             } else {
+                if (req.id !== undefined) {
+                    pendingRequests.set(req.id, socket);
+                }
                 sendToChrome(req);
             }
         } catch (e) {
@@ -87,10 +91,12 @@ const server = net.createServer((socket) => {
     socket.on('error', (err) => log(`Socket Error: ${err.message}`));
     socket.on('end', () => {
         log('CLI disconnected');
-        if (externalSocket === socket) {
-            externalSocket = null;
-            checkExitConditions(); // CLI 断开时检查是否需要退出
+        authenticatedSockets.delete(socket);
+        // 清理该 socket 关联的挂起请求
+        for (const [id, s] of pendingRequests.entries()) {
+            if (s === socket) pendingRequests.delete(id);
         }
+        checkExitConditions(); // CLI 断开时检查是否需要退出
     });
 });
 
@@ -123,10 +129,19 @@ function startServer(port) {
         if (raw.includes('authenticated')) {
             // 发送状态查询
             checkClient.write(JSON.stringify({ jsonrpc: "2.0", id: "check", method: 'getHostStatus' }) + '\n');
-        } else if (raw.includes('getHostStatus')) {
+        } else if (raw.includes('"id":"check"') || raw.includes('chromeConnected')) {
             isHandled = true;
             try {
-                const status = JSON.parse(raw).result;
+                // 兼容粘包情况，逐行解析
+                const lines = raw.split('\n');
+                let statusObj = null;
+                for (const line of lines) {
+                    if (line.includes('"id":"check"') || line.includes('chromeConnected')) {
+                        statusObj = JSON.parse(line.trim());
+                        break;
+                    }
+                }
+                const status = statusObj ? statusObj.result : JSON.parse(raw).result;
                 if (status.chromeConnected === false) {
                     log(`Port ${port} is a zombie (orphaned). Sending shutdown...`);
                     checkClient.write(JSON.stringify({ jsonrpc: "2.0", id: "die", method: 'shutdown' }) + '\n');
@@ -198,8 +213,18 @@ async function handleChromeRequest(req) {
 
     if (isResponse) {
         log(`Response from Chrome for ID: ${id}`);
-        if (externalSocket && externalSocket.writable) {
-            externalSocket.write(JSON.stringify(req) + '\n');
+        const clientSocket = pendingRequests.get(id);
+        if (clientSocket && clientSocket.writable) {
+            clientSocket.write(JSON.stringify(req) + '\n');
+            pendingRequests.delete(id);
+        } else {
+            // Fallback: 如果没有找到对应的 socket，则广播或发送给第一个可用客户端
+            for (const sock of authenticatedSockets) {
+                if (sock.writable) {
+                    sock.write(JSON.stringify(req) + '\n');
+                    break;
+                }
+            }
         }
         return;
     }
@@ -231,9 +256,15 @@ async function handleChromeRequest(req) {
                 });
             default:
                 // 如果不是本地处理的方法，则尝试转发给外部 CLI (如果有的话)
-                if (externalSocket && externalSocket.writable) {
-                    externalSocket.write(JSON.stringify(req) + '\n');
-                    return; // 异步处理由 externalSocket 回复
+                let forwarded = false;
+                for (const sock of authenticatedSockets) {
+                    if (sock.writable) {
+                        sock.write(JSON.stringify(req) + '\n');
+                        forwarded = true;
+                    }
+                }
+                if (forwarded) {
+                    return; // 异步处理由外部 CLI 回复
                 }
                 if (id !== undefined) {
                     throw new Error(`Method ${method} not supported by Host`);

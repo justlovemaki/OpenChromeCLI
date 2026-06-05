@@ -11,7 +11,13 @@
     "history",
     "downloads",
     "storage",
-    "scripting"
+    "scripting",
+    "activeTab",
+    "cookies",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "<all_urls>"
   ],
   "web_accessible_resources": [
     {
