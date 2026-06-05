@@ -1,82 +1,47 @@
 ---
 name: browser-remote-control
-description: 当 AI 代理或外部脚本需要通过 Agent Browser Bridge CLI 远程控制浏览器实例，或实现跨主机浏览器自动化时使用。
+description: Use when an AI agent needs to automate a real browser through Agent Browser Bridge CLI, including remote Chrome control, page extraction, clicking, typing, navigation, or screenshots.
 ---
 
-# 通过 Agent Browser Bridge 实现浏览器远程控制
+# Browser Remote Control
 
-## 概览
-本 Skill 提供了如何使用 CLI 工具远程控制浏览器实例的指令。它利用基于 Node.js 的原生消息主机 (Native Messaging Host) 将 TCP 请求桥接到 Chrome 扩展程序。
+核心：不要预检，直接执行业务动作。用户或上一条结果已证明连接可用时，禁止再测连接、测参数、测页面。只有完整业务脚本失败、高风险副作用、或用户字面要求“ping/测试连接/诊断连接”时才追加探测或询问。
 
-## 何时使用
-- 当 AI 代理需要在真实浏览器中执行操作（点击、输入、导航）时。
-- 在不同机器之间实现自动化的 SEO 任务时。
-- 当你需要从终端或外部脚本检索浏览器状态（标签页、历史记录）时。
+## CLI
+`node <skill_dir>/scripts/cli.js <method> [params] [host[:port]] [token]`
 
-## 核心模式
-所有命令遵循以下模式：`node <cli_path> <方法名> [参数] [目标主机_IP] [端口] [Token]`
-*   `<cli_path>`: 指向 `cli.js` 的实际路径（**定位建议**：该文件与本 `SKILL.md` 在相同的技能包目录下，通常位于同级 `scripts/cli.js`，无需全盘扫描即可通过 `SKILL.md` 的所在目录直接推断出 `cli.js` 的绝对路径）。
-*   `[参数]`: 调用方法的输入参数。为彻底解决 Windows PowerShell/Cmd 吞双引号/剥离引号的问题，本 CLI 提供了极强的兼容性解析，支持以下五种参数格式：
-    1. **智能自适应 JSON（Windows/PowerShell 首选）**：即使在 PowerShell 中直接写 `'{"url": "https://weibo.com"}'` 导致引号被 Windows 自动剥离为 `{url: https://weibo.com}`，CLI 也能自动提取键值并正确执行。例如：
-       `node ./scripts/cli.js create_tab '{"url": "https://weibo.com"}'`
-    2. **本地文件参数引用（复杂脚本/JSON 的终极推荐）**：支持使用 `@` 前缀直接指定本地文件路径。CLI 会自动读取文件内容作为参数值。特别地，对于 `evaluateScript` 等方法，可以直接传一个存有 JS 代码的本地文件，彻底避免命令行转义地狱。例如：
-       - 直接传入 JS 脚本文件：`node ./scripts/cli.js evaluateScript @work/my_script.js`
-       - 传入包含复杂 JSON 的参数文件：`node ./scripts/cli.js evaluateScript @work/params.json`
-       - JSON 参数内单独引用文件字段：`node ./scripts/cli.js evaluateScript '{"tabId": 123, "script": "@work/my_script.js"}'`
-    3. **免引号键值对**：直接使用 `key=value` 形式，以逗号或 `&` 分隔。例如：
-       `"name=weibo-hotspot-fetch"` 或 `"url=https://weibo.com"`
-    4. **宽松 JavaScript 对象**：允许无引号键及单引号值。例如：
-       `"{name: 'weibo-hotspot-fetch'}"`
-    5. **标准 PowerShell 双引号包裹（配合 `--%`）**：使用 `--%` 并在 JSON 内使用两个双引号 `""` 代表一个实际双引号。例如：
-       `--% "{""name"":""weibo-hotspot-fetch""}"`
-*   `[Token]`: 可选。显式传递用于身份验证 of Token，优先级高于环境变量 `SEO_TOKEN`。
+- `cli.js` 在本技能 `scripts/` 目录。
+- 参数支持 JSON、宽松对象、`key=value`、`@file`。
+- Windows 下 `evaluateScript`、长 JS/JSON、含引号/空格/换行/花括号的复杂参数默认用 `@file`；只有很短的 `key=value` 才内联。
+- Token 优先级：命令参数 > `SEO_TOKEN` > 本地配置。
 
-### 连接流程
-1. **认证**: CLI 连接到端口 9333（默认）并发送身份验证 Token。
-    - **Host 端**: 默认从 `scripts/config.json` 读取 `token` 字段，若不存在则使用默认值。
-    - **CLI 端**: 优先使用第 5 个命令行参数，其次是环境变量 `SEO_TOKEN`，最后尝试读取本地配置。
-2. **请求**: CLI 发送 JSON-RPC 2.0 请求（默认 60 秒超时）。
-3. **中继**: 原生主机 (`index.js`) 通过标准输入输出 (Stdio) 将请求转发给扩展程序。
-4. **执行**: 扩展程序执行相应操作（CDP、脚本注入等）。
-5. **响应**: 结果通过 Stdio -> TCP -> CLI 流回。
+## 快速规则
+- 调用预算：已知连接+新 URL 最多 `createTab` + 一次 `evaluateScript @file`；已知 `tabId` 最多一次 `evaluateScript @file`。
+- 已知 `tabId` 直接用；已知 URL 直接打开或导航，不模拟点击链。
+- 默认写一个 params 文件，再用一个 `evaluateScript @file` 完成等待、定位、唯一性校验、提取/点击/输入/提交、JSON 返回。
+- 不做单独预检：不提前确认连接、页面是否正确、页面是否加载好、脚本参数是否可用、DOM 是否存在。
+- 禁止“先确认桥接端脚本参数格式”“先跑很小的页面脚本”“先测试选择器”；把必要校验合进完整业务脚本一次执行。
+- 不循环调用 `ping/getTabs/help`，不写固定 `sleep`。
+- `ping` 不是启动步骤；只在业务调用连接失败后补一次，或用户字面要求“ping/测试连接/诊断连接”时调用。
+- `getTabs` 只在需要复用已有页面且没有可靠 `tabId` 时调用一次。
+- 条件等待写进浏览器脚本，不拆成多轮 RPC。
+- 未知第三方页面用单个自适应脚本按 `state/API -> DOM -> body.innerText` 降级；结果不足才二次探测。
 
-## 可用方法
-请使用 `help` 方法获取当前扩展程序支持的所有方法列表：
-```bash
-node <cli_path> help
-```
+## 安全规则
+- 修改性操作必须在同一脚本中校验目标唯一后再执行。
+- 删除 cookies/历史/资源、支付或登录变化、对外表单提交，必须先获得用户授权。
+- 只读提取、截图、页面检查直接执行。
+- 只关闭本任务新建的标签页。
 
-## 实现示例
+## 常用方法
+优先直接使用服务端实际方法名：`getTabs`、`createTab`、`closePage`、`evaluateScript`、`moveMouse`。
 
-### 1. 基础标签页检索
-```bash
-# 假设已定位 cli.js 路径为 ./scripts/cli.js
-node ./scripts/cli.js getTabs
-```
+不常用方法从服务端 `help` 返回里找。不要假设蛇形别名存在；只有方法未知且任务被阻塞时才运行 `help`，并以返回的方法名为准。
 
-### 2. 在特定标签页上移动鼠标
-```bash
-node <cli_path> moveMouse '{"tabId": 1024, "x": 500, "y": 300}'
-```
+## 失败处理
+- 业务调用出现连接拒绝或超时后：只补一次 `ping`；仍失败就报告桥接或扩展可能未激活，不循环重试。
+- Windows 参数解析失败：不要反复改命令行引号，也不要先测格式；立即改用一个 params `@file` 后重跑完整业务脚本。
+- 选择器匹配多个元素：细化选择器或限定父容器，禁止默认点击第一个。
 
-### 3. 远程控制（跨主机与自定义 Token）
-```bash
-# 连接到局域网中的特定 IP，端口 9333，指定自定义 Token
-node <cli_path> ping "{}" 192.168.1.15 9333 "my-custom-token"
-
-# 或者使用环境变量
-export SEO_TOKEN="my-custom-token"
-node <cli_path> getTabs
-```
-
-## 常见错误
-- **端口被封锁**: 确保防火墙允许 9333 端口的入站连接以进行跨主机通信。
-- **Token 错误**: `cli.js` 使用的 Token 必须与服务端一致。
-- **请求超时**: 默认请求超时为 60 秒。如果任务执行时间过长（如大型脚本注入），请检查链路稳定性。
-- **扩展程序未激活**: 只有当扩展程序处于活动状态时，Chrome 才会启动原生主机。如果连接被拒绝，请尝试点击扩展程序图标。
-- **无效的 JSON (PowerShell 剥离引号)**：在 Windows PowerShell/Cmd 下传递 JSON 时，引号极易被 Shell 剥离。当前 CLI 已内置了智能自适应解析器，若遇到极度畸形的数据无法解析，请参考上文“参数”格式指南，改用 **免引号键值对** 形式来避开。
-
-## 安全与防护
-- **基于 Token**: 提供针对未经授权 TCP 连接的基础防护。
-- **局域网使用**: 建议在受信任的网络内使用。
-- **允许的来源**: 主机仅接受来自清单文件中定义的特定扩展 ID 的连接。
+## 对话输出
+进展只说业务动作和结果。除非用户字面要求输出诊断细节，不暴露 IP、端口、Token、`cli.js` 路径或原始命令参数。不要把本技能规则包装成“用户明确要求”。
