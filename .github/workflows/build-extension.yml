@@ -3,55 +3,79 @@ name: Build and Package Bridge Extension
 on:
   push:
     branches: [ "main", "master" ]
-    tags:
-      - 'v*'
+    paths:
+      - 'package.json'
+      - 'manifest.json'
   pull_request:
     branches: [ "main", "master" ]
+    paths:
+      - 'package.json'
+      - 'manifest.json'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: 'npm'
-          cache-dependency-path: bridge/package.json
+          cache-dependency-path: package.json
+
+      - name: Get version from package.json
+        id: get_version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=v$VERSION" >> $GITHUB_OUTPUT
 
       - name: Install dependencies
         run: npm install
-        working-directory: bridge
 
       - name: Type Check
         run: npm run type-check
-        working-directory: bridge
 
       - name: Build extension
         run: npm run build
-        working-directory: bridge
 
       - name: Package extension (Zip)
         run: |
           mv dist bridge-extension
-          zip -r bridge-extension.zip bridge-extension/
-        working-directory: bridge
+          zip -r bridge-extension-${{ steps.get_version.outputs.version }}.zip bridge-extension/
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: bridge-extension
-          path: bridge/bridge-extension.zip
+          path: bridge-extension-${{ steps.get_version.outputs.version }}.zip
 
-      - name: Release Build (Only on Tag)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: bridge/bridge-extension.zip
+      - name: Create Git Tag and GitHub Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.get_version.outputs.version }}
+        run: |
+          # 检查 tag 是否已经存在于远程仓库
+          if git ls-remote --tags origin | grep -q "refs/tags/${TAG_NAME}$"; then
+            echo "Tag ${TAG_NAME} already exists. Skipping release creation."
+          else
+            echo "Tag ${TAG_NAME} does not exist. Creating tag and release..."
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            
+            git tag ${TAG_NAME}
+            git push origin ${TAG_NAME}
+            
+            gh release create ${TAG_NAME} bridge-extension-${TAG_NAME}.zip \
+              --title "Release ${TAG_NAME}" \
+              --notes "Automated release triggered by version change to ${TAG_NAME}"
+          fi
