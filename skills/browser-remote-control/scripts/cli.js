@@ -3,27 +3,43 @@ const fs = require('fs');
 const path = require('path');
 
 let SECRET_TOKEN = process.env.SEO_TOKEN || 'bridge-relay-secure-token-2026';
+let PORT = parseInt(process.env.SEO_PORT || '9333', 10);
 
 // 如果环境变量没设，尝试从配置文件读取
-if (SECRET_TOKEN === 'bridge-relay-secure-token-2026') {
+{
     try {
-        const configPath = path.join(__dirname, '..', '..', '..', 'native-host', 'config.json');
-        if (fs.existsSync(configPath)) {
+        const configPaths = [
+            path.join(__dirname, '..', '..', '..', 'host', 'config.json'),
+            path.join(__dirname, '..', '..', '..', 'native-host', 'config.json')
+        ];
+        const configPath = configPaths.find(p => fs.existsSync(p));
+        if (configPath) {
             const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            if (config.token) {
+            if (SECRET_TOKEN === 'bridge-relay-secure-token-2026' && config.token) {
                 SECRET_TOKEN = config.token;
+            }
+            if (!process.env.SEO_PORT && config.port) {
+                PORT = parseInt(config.port, 10);
             }
         }
     } catch (e) {}
 }
 
-let PORT = 9333;
+const rawArgs = process.argv.slice(2);
 
-const args = process.argv.slice(2);
-if (args.length < 1) {
-    console.log('Usage: node cli.js <method> [params_json] [host] [port] [token]');
-    console.log('   or: node cli.js <method> [params_json] [host:port] [token]');
-    process.exit(1);
+function printUsage() {
+    console.log('Usage: node cli.js <method> [params_json|key=value...] [host] [port] [token]');
+    console.log('   or: node cli.js <method> [params_json|key=value...] [host:port] [token]');
+    console.log('   or: node cli.js --method <method> --params-file <file> [--host <host>] [--port <port>] [--token <token>]');
+    console.log('   or: node cli.js <method> --stdin');
+    console.log('   or: node cli.js <method> --params-base64 <base64-json>');
+    console.log('   or: SEO_PARAMS=\'{"tabId":1}\' node cli.js <method>');
+    console.log('Environment: SEO_TOKEN, SEO_PORT, SEO_PARAMS');
+}
+
+if (rawArgs.length < 1 || rawArgs.includes('--help') || rawArgs.includes('-h')) {
+    printUsage();
+    process.exit(rawArgs.length < 1 ? 1 : 0);
 }
 
 function tryParseRelaxedJson(str) {
@@ -121,67 +137,223 @@ function tryParseRelaxedJson(str) {
     throw new Error("Could not parse parameters as JSON or Key-Value pairs.");
 }
 
-const method = args[0];
-let params = {};
-if (args[1] && args[1] !== "{}") {
-    try {
-        if (args[1].startsWith('@')) {
-            const filePath = path.resolve(args[1].substring(1));
-            if (!fs.existsSync(filePath)) {
-                console.error(`Error: Parameter file does not exist: ${filePath}`);
-                process.exit(1);
-            }
-            const fileContent = fs.readFileSync(filePath, 'utf8').trim();
-            try {
-                params = tryParseRelaxedJson(fileContent);
-            } catch (e) {
-                // 如果解析失败，且当前是脚本执行方法，则将其包装为 script 参数
-                const scriptMethods = ['evaluatescript', 'evaluate_script', 'evaluate', 'eval', 'evaluate_code'];
-                if (scriptMethods.includes(method.toLowerCase())) {
-                    params = { script: fileContent };
-                } else {
-                    console.error('Invalid JSON/Key-Value params in file:', e.message);
-                    process.exit(1);
-                }
-            }
-        } else {
-            params = tryParseRelaxedJson(args[1]);
-        }
+function isScriptMethod(name) {
+    return ['evaluatescript', 'evaluate_script', 'evaluate', 'eval', 'evaluate_code'].includes(String(name || '').toLowerCase());
+}
 
-        // 遍历参数，处理字段值中以 @ 开头的文件路径引用
-        if (params && typeof params === 'object') {
-            for (const key of Object.keys(params)) {
-                if (typeof params[key] === 'string' && params[key].startsWith('@')) {
-                    const refPath = path.resolve(params[key].substring(1));
-                    if (fs.existsSync(refPath)) {
-                        params[key] = fs.readFileSync(refPath, 'utf8');
-                    }
-                }
-            }
-        }
+function decodeBase64Text(value) {
+    let normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (normalized.length % 4) normalized += '=';
+    return Buffer.from(normalized, 'base64').toString('utf8');
+}
+
+function looksLikeKeyValue(value) {
+    return /^[a-zA-Z0-9_$]+\s*[:=]/.test(String(value || '').trim());
+}
+
+function looksLikePort(value) {
+    return /^\d+$/.test(String(value || '').trim());
+}
+
+function applyHostPort(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return;
+
+    const hostPort = raw.match(/^(.+):(\d+)$/);
+    if (hostPort) {
+        targetHost = hostPort[1] || '127.0.0.1';
+        PORT = parseInt(hostPort[2], 10);
+        return;
+    }
+
+    targetHost = raw;
+}
+
+function parseParamsFromText(text, sourceType, methodName) {
+    const content = String(text || '');
+    if (!content.trim()) return {};
+
+    try {
+        return tryParseRelaxedJson(content);
     } catch (e) {
-        console.error('Invalid JSON/Key-Value params:', e.message);
-        process.exit(1);
+        if (isScriptMethod(methodName) && sourceType !== 'literal-json') {
+            return { script: content };
+        }
+        throw e;
     }
 }
 
-let targetHost = args[2] || '127.0.0.1';
+function resolveFileRefs(value) {
+    if (Array.isArray(value)) {
+        return value.map(resolveFileRefs);
+    }
 
-// 支持从 host 参数中解析端口 (例如 127.0.0.1:9444)
-if (targetHost.includes(':')) {
-    const parts = targetHost.split(':');
-    targetHost = parts[0];
-    PORT = parseInt(parts[1], 10);
+    if (value && typeof value === 'object') {
+        for (const key of Object.keys(value)) {
+            value[key] = resolveFileRefs(value[key]);
+        }
+        return value;
+    }
+
+    if (typeof value === 'string' && value.startsWith('@')) {
+        const refPath = path.resolve(value.substring(1));
+        if (fs.existsSync(refPath)) {
+            return fs.readFileSync(refPath, 'utf8');
+        }
+    }
+
+    return value;
 }
 
-// 支持显式传递第 4 个参数作为端口
-if (args[3]) {
-    PORT = parseInt(args[3], 10);
+function readParamsSource(source, methodName) {
+    if (!source) return {};
+
+    if (source.type === 'file') {
+        const filePath = path.resolve(source.value);
+        if (!fs.existsSync(filePath)) {
+            console.error(`Error: Parameter file does not exist: ${filePath}`);
+            process.exit(1);
+        }
+        return parseParamsFromText(fs.readFileSync(filePath, 'utf8'), 'file', methodName);
+    }
+
+    if (source.type === 'stdin') {
+        return parseParamsFromText(fs.readFileSync(0, 'utf8'), 'stdin', methodName);
+    }
+
+    if (source.type === 'base64') {
+        return parseParamsFromText(decodeBase64Text(source.value), 'base64', methodName);
+    }
+
+    if (source.type === 'env') {
+        const envValue = process.env[source.value];
+        if (envValue === undefined) {
+            console.error(`Error: Environment variable ${source.value} is not set`);
+            process.exit(1);
+        }
+        return parseParamsFromText(envValue, 'env', methodName);
+    }
+
+    return parseParamsFromText(source.value, source.type || 'literal-json', methodName);
 }
 
-// 显式传递第 5 个参数作为 Token
-if (args[4]) {
-    SECRET_TOKEN = args[4];
+let method = null;
+let paramsSource = null;
+let targetHost = '127.0.0.1';
+let explicitHost = false;
+let explicitPort = false;
+let explicitToken = false;
+const positional = [];
+
+for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+
+    const readNext = (optionName) => {
+        if (i + 1 >= rawArgs.length) {
+            console.error(`Missing value for ${optionName}`);
+            process.exit(1);
+        }
+        return rawArgs[++i];
+    };
+
+    if (arg === '--') {
+        positional.push(...rawArgs.slice(i + 1));
+        break;
+    } else if (arg === '--method' || arg === '-m') {
+        method = readNext(arg);
+    } else if (arg === '--params' || arg === '-p') {
+        paramsSource = { type: 'literal-json', value: readNext(arg) };
+    } else if (arg === '--params-file' || arg === '--file' || arg === '-f') {
+        paramsSource = { type: 'file', value: readNext(arg) };
+    } else if (arg === '--stdin' || arg === '--params-stdin') {
+        paramsSource = { type: 'stdin' };
+    } else if (arg === '--params-base64' || arg === '--base64') {
+        paramsSource = { type: 'base64', value: readNext(arg) };
+    } else if (arg === '--params-env' || arg === '--env') {
+        paramsSource = { type: 'env', value: readNext(arg) };
+    } else if (arg === '--host') {
+        applyHostPort(readNext(arg));
+        explicitHost = true;
+    } else if (arg === '--port') {
+        PORT = parseInt(readNext(arg), 10);
+        explicitPort = true;
+    } else if (arg === '--token') {
+        SECRET_TOKEN = readNext(arg);
+        explicitToken = true;
+    } else if (!method) {
+        method = arg;
+    } else {
+        positional.push(arg);
+    }
+}
+
+if (!method) {
+    printUsage();
+    process.exit(1);
+}
+
+let params = {};
+
+let consumedPositionals = 0;
+if (!paramsSource && positional.length > 0) {
+    if (positional[0] === '{}') {
+        consumedPositionals = 1;
+    } else if (positional[0].startsWith('@')) {
+        paramsSource = { type: 'file', value: positional[0].substring(1) };
+        consumedPositionals = 1;
+    } else if (looksLikeKeyValue(positional[0])) {
+        const parts = [];
+        while (consumedPositionals < positional.length && looksLikeKeyValue(positional[consumedPositionals])) {
+            parts.push(positional[consumedPositionals]);
+            consumedPositionals++;
+        }
+        paramsSource = { type: 'literal-json', value: parts.join(',') };
+    } else {
+        paramsSource = { type: 'literal-json', value: positional[0] };
+        consumedPositionals = 1;
+    }
+}
+
+if (!paramsSource && process.env.SEO_PARAMS) {
+    paramsSource = { type: 'env', value: 'SEO_PARAMS' };
+}
+
+try {
+    params = resolveFileRefs(readParamsSource(paramsSource, method));
+} catch (e) {
+    console.error('Invalid params:', e.message);
+    process.exit(1);
+}
+
+const legacyTail = positional.slice(consumedPositionals);
+if (legacyTail[0] && !explicitHost) {
+    applyHostPort(legacyTail[0]);
+    const hostHadPort = /^(.+):(\d+)$/.test(String(legacyTail[0]).trim());
+
+    if (hostHadPort) {
+        if (legacyTail[1] && !explicitToken) {
+            SECRET_TOKEN = legacyTail[1];
+        }
+    } else {
+        if (legacyTail[1] && looksLikePort(legacyTail[1]) && !explicitPort) {
+            PORT = parseInt(legacyTail[1], 10);
+            if (legacyTail[2] && !explicitToken) {
+                SECRET_TOKEN = legacyTail[2];
+            }
+        } else if (legacyTail[1] && !explicitToken) {
+            SECRET_TOKEN = legacyTail[1];
+        }
+    }
+} else if (legacyTail[0] && !explicitPort && looksLikePort(legacyTail[0])) {
+    PORT = parseInt(legacyTail[0], 10);
+    if (legacyTail[1] && !explicitToken) {
+        SECRET_TOKEN = legacyTail[1];
+    }
+}
+
+if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
+    console.error(`Invalid port: ${PORT}`);
+    process.exit(1);
 }
 
 const client = new net.Socket();
@@ -206,7 +378,7 @@ client.on('data', (data) => {
                     method: method,
                     params: params
                 };
-                client.write(JSON.stringify(request));
+                client.write(JSON.stringify(request) + '\n');
             }
         } catch (e) {
             console.error('Auth response error:', raw);

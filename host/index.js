@@ -4,16 +4,22 @@ const net = require('net');
 
 const LOG_FILE = path.join(__dirname, 'host.log');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
-const START_PORT = 9333;
+let START_PORT = 9333;
 
 let SECRET_TOKEN = 'bridge-relay-secure-token-2026';
 
-// 尝试从配置文件加载 Token
+// 尝试从配置文件加载 Token 和端口
 try {
     if (fs.existsSync(CONFIG_FILE)) {
         const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
         if (config.token) {
             SECRET_TOKEN = config.token;
+        }
+        if (config.port) {
+            const configuredPort = parseInt(config.port, 10);
+            if (Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65535) {
+                START_PORT = configuredPort;
+            }
         }
     }
 } catch (e) {
@@ -24,6 +30,7 @@ const authenticatedSockets = new Set();
 const pendingRequests = new Map(); // id -> socket
 let stdinBuffer = Buffer.alloc(0);
 let chromeConnected = true;
+const MAX_SOCKET_BUFFER = 10 * 1024 * 1024;
 
 function log(msg) {
     try {
@@ -40,19 +47,81 @@ function checkExitConditions() {
     }
 }
 
+function handleRemoteRequest(socket, req) {
+    log(`From Remote CLI (${socket.remoteAddress}): ${JSON.stringify(req)}`);
+
+    // 处理特殊管理指令
+    if (req.method === 'ping') {
+        socket.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: "pong" }) + '\n');
+    } else if (req.method === 'getHostStatus') {
+        socket.write(JSON.stringify({
+            jsonrpc: "2.0",
+            id: req.id,
+            result: { chromeConnected, pid: process.pid }
+        }) + '\n');
+    } else if (req.method === 'shutdown') {
+        log('Shutdown requested via TCP');
+        socket.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: "ok" }) + '\n');
+        setTimeout(() => process.exit(0), 100);
+    } else {
+        if (req.id !== undefined) {
+            pendingRequests.set(req.id, socket);
+        }
+        sendToChrome(req);
+    }
+}
+
+function handleRemotePayload(socket, raw) {
+    socket.rpcBuffer = (socket.rpcBuffer || '') + raw;
+
+    let boundary;
+    let parsedLine = false;
+    while ((boundary = socket.rpcBuffer.indexOf('\n')) !== -1) {
+        const line = socket.rpcBuffer.slice(0, boundary).trim();
+        socket.rpcBuffer = socket.rpcBuffer.slice(boundary + 1);
+        if (!line) continue;
+        parsedLine = true;
+        handleRemoteRequest(socket, JSON.parse(line));
+    }
+
+    if (!parsedLine && socket.rpcBuffer.trim()) {
+        try {
+            const req = JSON.parse(socket.rpcBuffer.trim());
+            socket.rpcBuffer = '';
+            handleRemoteRequest(socket, req);
+        } catch (e) {
+            if (socket.rpcBuffer.length > MAX_SOCKET_BUFFER) {
+                socket.write(JSON.stringify({ error: 'Request too large or malformed' }) + '\n');
+                socket.rpcBuffer = '';
+            }
+        }
+    }
+}
+
 const server = net.createServer((socket) => {
     log(`Incoming TCP connection from ${socket.remoteAddress}`);
     socket.isAuthenticated = false;
+    socket.rpcBuffer = '';
 
     socket.on('data', (data) => {
         try {
-            const raw = data.toString().trim();
+            const raw = data.toString();
             if (!socket.isAuthenticated) {
-                if (raw === SECRET_TOKEN) {
+                const tokenLineEnd = raw.indexOf('\n');
+                const tokenCandidate = (tokenLineEnd === -1 ? raw : raw.slice(0, tokenLineEnd)).trim();
+
+                if (tokenCandidate === SECRET_TOKEN) {
                     socket.isAuthenticated = true;
                     authenticatedSockets.add(socket);
                     socket.write(JSON.stringify({ status: 'authenticated' }) + '\n');
                     log(`Auth Success: ${socket.remoteAddress}`);
+
+                    if (tokenLineEnd !== -1) {
+                        const rest = raw.slice(tokenLineEnd + 1);
+                        if (rest.trim()) {
+                            handleRemotePayload(socket, rest);
+                        }
+                    }
                 } else {
                     log(`Auth Failed: ${socket.remoteAddress}`);
                     socket.write(JSON.stringify({ error: 'Unauthorized' }) + '\n');
@@ -61,28 +130,7 @@ const server = net.createServer((socket) => {
                 return;
             }
 
-            const req = JSON.parse(raw);
-            log(`From Remote CLI (${socket.remoteAddress}): ${raw}`);
-            
-            // 处理特殊管理指令
-            if (req.method === 'ping') {
-                socket.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: "pong" }) + '\n');
-            } else if (req.method === 'getHostStatus') {
-                socket.write(JSON.stringify({ 
-                    jsonrpc: "2.0", 
-                    id: req.id, 
-                    result: { chromeConnected, pid: process.pid } 
-                }) + '\n');
-            } else if (req.method === 'shutdown') {
-                log('Shutdown requested via TCP');
-                socket.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result: "ok" }) + '\n');
-                setTimeout(() => process.exit(0), 100);
-            } else {
-                if (req.id !== undefined) {
-                    pendingRequests.set(req.id, socket);
-                }
-                sendToChrome(req);
-            }
+            handleRemotePayload(socket, raw);
         } catch (e) {
             log(`TCP Logic Error: ${e.message}`);
         }
