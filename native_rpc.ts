@@ -515,6 +515,7 @@ export class NativeRelayHandler {
     private router: JsonRpcRouter | null = null;
     private currentGroupName: string | null = null;
     private coordinator = new SessionCoordinator();
+    private groupedTabs: Set<number> = new Set();
 
     // 定义 RPC 方法的文档元数据
     public readonly _rpcMetadata: Record<string, { description: string, params?: string[] }> = {
@@ -727,7 +728,31 @@ export class NativeRelayHandler {
 
     private async runTabOperation<T>(params: SessionScopedParams, task: () => Promise<T> | T) {
         this.coordinator.assertTabAccess(params.tabId!, params);
-        return await this.coordinator.runExclusive(params, task);
+        return await this.coordinator.runExclusive(params, async () => {
+            await this.ensureTabGrouped(params);
+            return await task();
+        });
+    }
+
+    private getAutomationGroupName(params?: SessionScopedParams) {
+        const raw = String(params?.group || params?.name || params?.sessionId || params?.session_id || this.currentGroupName || "Agent Session");
+        const ascii = raw.normalize("NFKD")
+            .replace(/[^\x20-\x7e]+/g, "-")
+            .replace(/[^a-zA-Z0-9._ -]+/g, "-")
+            .replace(/\s+/g, " ")
+            .replace(/-+/g, "-")
+            .trim();
+        return (ascii || "Agent Session").slice(0, 80);
+    }
+
+    private async ensureTabGrouped(params: SessionScopedParams) {
+        if (!params?.tabId || this.groupedTabs.has(params.tabId)) return;
+        try {
+            await Agent.groupTab(params.tabId, this.getAutomationGroupName(params));
+            this.groupedTabs.add(params.tabId);
+        } catch (error) {
+            console.warn("Failed to group automation tab:", error?.message || error);
+        }
     }
 
     private requireSensitive(method: string, params?: SessionScopedParams) {
@@ -936,10 +961,13 @@ export class NativeRelayHandler {
         this.requireSensitive("createTab", params);
         const session = this.coordinator.ensureSession(params);
         const url = params?.url || "https://www.google.com";
-        const groupName = params?.group || this.currentGroupName || session.name || session.id || "CLI Session";
+        const groupName = this.getAutomationGroupName({ ...params, group: params?.group || this.currentGroupName || session.name || session.id || "CLI Session" });
         return await this.coordinator.runExclusive(params, async () => {
             const tab = await Agent.createTab(url, groupName);
-            if (tab.id) this.coordinator.claimTab(tab.id, params);
+            if (tab.id) {
+                this.coordinator.claimTab(tab.id, params);
+                this.groupedTabs.add(tab.id);
+            }
             return { id: tab.id, url: tab.url, sessionId: session.id, owner: session.owner };
         });
     }
@@ -992,6 +1020,7 @@ export class NativeRelayHandler {
     async claimTab(params: SessionScopedParams) {
         if (!params.tabId) throw new Error("Missing tabId");
         this.coordinator.claimTab(params.tabId, params);
+        await this.ensureTabGrouped(params);
         return { success: true, tabId: params.tabId, sessionId: this.coordinator.normalizeSessionId(params), owner: this.coordinator.normalizeOwner(params) };
     }
 
@@ -1070,6 +1099,7 @@ export class NativeRelayHandler {
 
     releaseClosedTab(tabId: number) {
         this.coordinator.releaseTab(tabId);
+        this.groupedTabs.delete(tabId);
     }
 
     async moveMouse(params: SessionScopedParams & { x: number; y: number; waitForArrival?: boolean; turn_id?: string }) {

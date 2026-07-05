@@ -548,11 +548,13 @@
         `;
         
         container.appendChild(ripple);
-        // 强制重绘
+        // 先短暂停留一帧，避免点击后立即导航时涟漪尚未被肉眼看到。
         ripple.offsetTop;
-        ripple.style.transform = 'scale(2.5)';
-        ripple.style.opacity = '0';
-        setTimeout(() => ripple.remove(), 1000);
+        setTimeout(() => {
+            ripple.style.transform = 'scale(2.5)';
+            ripple.style.opacity = '0';
+        }, 120);
+        setTimeout(() => ripple.remove(), 1150);
     }
 
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

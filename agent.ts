@@ -309,7 +309,8 @@ export const Agent: any = {
         }
     },
 
-    async humanClickAt(tabId, x, y, options: { clickCount?: number; width?: number; height?: number } = {}) {
+    async humanClickAt(tabId, x, y, options: { clickCount?: number; width?: number; height?: number; visual?: boolean } = {}) {
+        if (options.visual !== false) await this.installEvaluateClickFeedback(tabId);
         const target = this.jitterPoint(x, y, options.width || 0, options.height || 0);
         const start = {
             x: Math.max(1, Math.round(target.x + (Math.random() - 0.5) * 220)),
@@ -400,44 +401,63 @@ export const Agent: any = {
     async showVisualAction(tabId, pos, type = 'click') {
         if (!pos || pos.x === undefined || pos.y === undefined) return;
         const { x, y } = pos;
-        
+
+        const injectRipple = async () => {
+            if (!(await this.isTabScriptable(tabId))) return;
+            await this.executeScript(tabId, {
+                world: 'MAIN',
+                func: (x, y) => {
+                    const containerId = 'ai-visual-feedback-container';
+                    let container = document.getElementById(containerId);
+                    if (!container) {
+                        container = document.createElement('div');
+                        container.id = containerId;
+                        container.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483647;isolation:isolate;';
+                        (document.body || document.documentElement).appendChild(container);
+                    }
+
+                    const ring = document.createElement('div');
+                    ring.style.cssText = `
+                        position:fixed;left:${x}px;top:${y}px;width:18px;height:18px;margin-left:-9px;margin-top:-9px;
+                        border-radius:999px;background:rgba(16,185,129,.75);border:3px solid rgba(255,255,255,.95);
+                        box-shadow:0 0 0 4px rgba(16,185,129,.28),0 0 22px rgba(16,185,129,.8);
+                        transform:scale(.6);opacity:1;transition:transform .55s cubic-bezier(.2,.8,.2,1),opacity .55s ease;
+                    `;
+                    container.appendChild(ring);
+                    ring.getBoundingClientRect();
+                    setTimeout(() => {
+                        ring.style.transform = 'scale(4.2)';
+                        ring.style.opacity = '0';
+                    }, 60);
+                    setTimeout(() => ring.remove(), 850);
+                },
+                args: [x, y]
+            });
+        };
+
+        // Direct injection is the reliable path; content-script messaging is best-effort only.
+        try { await injectRipple(); } catch (innerErr) {}
+
         try {
-            // 优先使用 Content Script 消息，支持复杂的 CSS 动效和主题色
             await chrome.tabs.sendMessage(tabId, {
                 type: "SHOW_VISUAL_ACTION",
                 x, y,
                 actionType: type
             });
-        } catch (e) {
-            // 如果 Content Script 尚未加载或连接断开，回退到原生注入
-            try {
-                await this.executeScript(tabId, {
-                    func: (x, y) => {
-                        const containerId = 'ai-visual-feedback-container';
-                        let container = document.getElementById(containerId);
-                        if (!container) {
-                            container = document.createElement('div');
-                            container.id = containerId;
-                            container.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';
-                            document.documentElement.appendChild(container);
-                        }
-                        const ripple = document.createElement('div');
-                        // 统一使用翡翠绿主题色
-                        ripple.style.cssText = `
-                            position:absolute;left:${x}px;top:${y}px;width:40px;height:40px;margin-left:-20px;margin-top:-20px;
-                            border-radius:50%;background-color:rgba(16, 185, 129, 0.4);
-                            border:2px solid white;box-shadow:0 0 15px rgba(16, 185, 129, 0.3);
-                            transition:all 0.8s cubic-bezier(0.23, 1, 0.32, 1);transform:scale(0.1);opacity:1;
-                        `;
-                        container.appendChild(ripple);
-                        ripple.offsetTop; // 触发重绘
-                        ripple.style.transform = 'scale(2.5)'; ripple.style.opacity = '0';
-                        setTimeout(() => ripple.remove(), 1000);
-                    },
-                    args: [x, y]
-                });
-            } catch (innerErr) {}
-        }
+        } catch (e) {}
+
+        try {
+            await this.sendCDP(tabId, "Overlay.enable", {});
+            await this.sendCDP(tabId, "Overlay.highlightRect", {
+                x: Math.max(0, Math.round(x - 14)),
+                y: Math.max(0, Math.round(y - 14)),
+                width: 28,
+                height: 28,
+                color: { r: 16, g: 185, b: 129, a: 0.25 },
+                outlineColor: { r: 255, g: 255, b: 255, a: 0.95 }
+            });
+            setTimeout(() => this.sendCDP(tabId, "Overlay.hideHighlight", {}).catch(() => {}), 450);
+        } catch (e) {}
     },
 
     /**
@@ -500,10 +520,7 @@ export const Agent: any = {
         }
 
         // 1. 显示视觉反馈
-        const visualPoint = this.jitterPoint(x, y, meta.width, meta.height);
-        await this.showVisualAction(tabId, visualPoint, 'click');
-
-        // 2. 执行物理点击 (按下 + 抬起)
+        // 2. 执行物理点击 (按下 + 抬起)，水波纹在按下前一刻显示
         const clickCount = options.dblClick ? 2 : 1;
         
         try {
@@ -858,6 +875,7 @@ export const Agent: any = {
         if (!isRestricted) {
             // 普通页面直接且仅通过 CDP 运行，绕过页面的 CSP 限制并返回完整真实对象，坚决不降级
             try {
+                await this.installEvaluateClickFeedback(tabId);
                 const evaluate = (expression: string) => this.sendCDP(tabId, "Runtime.evaluate", {
                     expression,
                     returnByValue: true,
@@ -911,6 +929,72 @@ export const Agent: any = {
             return results?.[0]?.result;
         } catch (fallbackErr: any) {
             return { success: false, error: fallbackErr.message };
+        }
+    },
+
+    async installEvaluateClickFeedback(tabId: number) {
+        try {
+            await this.sendCDP(tabId, "Runtime.evaluate", {
+                expression: `(() => {
+                    try {
+                        const proto = HTMLElement && HTMLElement.prototype;
+                        if (proto && proto.__agentNativeClick) {
+                            proto.click = proto.__agentNativeClick;
+                            delete proto.__agentClickPatched;
+                            delete proto.__agentNativeClick;
+                        }
+                    } catch {}
+
+                    if (window.__agentClickFeedbackInstalled) return true;
+                    window.__agentClickFeedbackInstalled = true;
+
+                    const showFeedback = (target, event) => {
+                        try {
+                            let x = event && Number.isFinite(event.clientX) ? Math.round(event.clientX) : NaN;
+                            let y = event && Number.isFinite(event.clientY) ? Math.round(event.clientY) : NaN;
+                            if ((!Number.isFinite(x) || !Number.isFinite(y)) && target && typeof target.getBoundingClientRect === 'function') {
+                                const rect = target.getBoundingClientRect();
+                                if (!rect || rect.width < 1 || rect.height < 1) return;
+                                x = Math.round(rect.left + rect.width / 2);
+                                y = Math.round(rect.top + rect.height / 2);
+                            }
+                            if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+
+                            const containerId = 'ai-visual-feedback-container';
+                            let container = document.getElementById(containerId);
+                            if (!container) {
+                                container = document.createElement('div');
+                                container.id = containerId;
+                                container.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483647;isolation:isolate;';
+                                (document.body || document.documentElement).appendChild(container);
+                            }
+
+                            const ring = document.createElement('div');
+                            ring.style.cssText = 'position:fixed;left:' + x + 'px;top:' + y + 'px;width:18px;height:18px;margin-left:-9px;margin-top:-9px;border-radius:999px;background:rgba(16,185,129,.85);border:3px solid rgba(255,255,255,.98);box-shadow:0 0 0 4px rgba(16,185,129,.32),0 0 24px rgba(16,185,129,.9);transform:scale(.6);opacity:1;transition:transform .65s cubic-bezier(.2,.8,.2,1),opacity .65s ease;';
+                            container.appendChild(ring);
+                            ring.getBoundingClientRect();
+                            setTimeout(() => {
+                                ring.style.transform = 'scale(4.4)';
+                                ring.style.opacity = '0';
+                            }, 80);
+                            setTimeout(() => ring.remove(), 950);
+                        } catch {}
+                    };
+
+                    window.__agentShowClickFeedback = showFeedback;
+
+                    document.addEventListener('click', (event) => {
+                        try {
+                            showFeedback(event.target, event);
+                        } catch {}
+                    }, true);
+                    return true;
+                })()`,
+                returnByValue: true,
+                awaitPromise: true
+            });
+        } catch (error) {
+            // Best-effort visual hook only. Never block the actual evaluation.
         }
     },
 
@@ -973,8 +1057,6 @@ export const Agent: any = {
      * 纯坐标点击
      */
     async clickAt(tabId: number, x: number, y: number) {
-        const target = this.jitterPoint(x, y, 8, 8);
-        await this.showVisualAction(tabId, target, 'click');
         await this.humanClickAt(tabId, x, y, { clickCount: 1, width: 8, height: 8 });
         return { success: true };
     },
