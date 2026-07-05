@@ -736,13 +736,19 @@ export class NativeRelayHandler {
 
     private getAutomationGroupName(params?: SessionScopedParams) {
         const raw = String(params?.group || params?.name || params?.sessionId || params?.session_id || this.currentGroupName || "Agent Session");
-        const ascii = raw.normalize("NFKD")
+        const fallbackRaw = String(params?.sessionId || params?.session_id || this.currentGroupName || "Agent Session");
+        const clean = (value: string) => value.normalize("NFKD")
             .replace(/[^\x20-\x7e]+/g, "-")
             .replace(/[^a-zA-Z0-9._ -]+/g, "-")
             .replace(/\s+/g, " ")
             .replace(/-+/g, "-")
+            .replace(/^[ ._-]+|[ ._-]+$/g, "")
             .trim();
-        return (ascii || "Agent Session").slice(0, 80);
+        const ascii = clean(raw);
+        if (/[a-zA-Z0-9]/.test(ascii)) return ascii.slice(0, 80);
+        const fallback = clean(fallbackRaw);
+        if (/[a-zA-Z0-9]/.test(fallback)) return fallback.slice(0, 80);
+        return "Agent Session";
     }
 
     private async ensureTabGrouped(params: SessionScopedParams) {

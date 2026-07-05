@@ -13,7 +13,7 @@ description: Use when an AI agent needs to automate a real browser through Agent
 ## 🛑 核心红线（违反将导致任务失败）
 
 1. **零预检原则**：严禁在执行业务前单独调用接口去“确认连接”、“测试选择器”、“测试参数”或“确认页面是否可达”。
-2. **单步合并原则**：严禁将业务拆成多次 CLI 调用。必须将“等待页面加载、元素存在性校验、定位、操作（点击/输入）、提取数据、返回结果”全部合并到**一个** `evaluateScript` 脚本中一次性执行。
+2. **优先使用已有工具 + 单步合并原则**：必须优先使用本 skill 已提供的 RPC 工具（`readPage`、`click`、`typeText`、`fillForm`、`waitFor`、`takeScreenshot` 等）。在遵守工具优先级的前提下尽量合并同类动作，避免无意义预检和碎片化调用；但严禁为了“单步”而把点击、输入、确认门控等已有工具能力绕到 `evaluateScript` 里实现。只有现有工具无法表达业务逻辑，或需要复杂页面内数据整理时，才允许使用 `evaluateScript`。
 3. **静默执行原则**：除非业务脚本报错，或者用户字面明确要求“测试/ping/诊断”，否则**绝对不**调用 `ping` / `help`。
 4. **绝对信任用户上下文（免预检核心）**：
    - **如果用户或上文指出“页面已打开/标签页已创建/URL已加载”，必须无条件信任此状态**。
@@ -25,6 +25,21 @@ description: Use when an AI agent needs to automate a real browser through Agent
 ## 🧩 接口方法命名与参数规范 (API Spec)
 
 所有方法必须使用严格的**驼峰命名**，且参数必须严格匹配以下 Schema 结构，**严禁遗漏任何必填参数**：
+
+### -1. 工具优先级与单步合并（必须遵守）
+- 两条规则不冲突：**工具优先级决定用什么工具，单步合并决定如何减少无意义调用**。
+- 正确做法：`readPage` 获取 UID 后，用 `click` / `typeText` / `fillForm` / `waitFor` 执行业务动作；需要复杂结果整理时，再用 `evaluateScript` 做数据聚合。
+- 错误做法：为了把任务压成一次调用，在 `evaluateScript` 里直接 `querySelector`、`.click()`、`input.value = ...`，从而绕过 humanize、点击反馈、session 队列、确认门控和错误处理。
+- 另一个错误做法：为了“优先工具”把每个字符、每个等待、每个小动作拆成大量 CLI 调用；应优先用 `fillForm` 批量填表、`waitFor` 等待、`readPage` 一次读取页面状态。
+- **页面状态读取**：优先 `readPage`，不要用 `evaluateScript` 直接扫 DOM，除非需要复杂聚合或站点定制解析。
+- **点击元素**：优先 `click(tabId, uid)`。必须先通过 `readPage` 获取 UID；不要在 `evaluateScript` 里直接写 `element.click()`，因为这会绕过插件层的 humanize 点击、点击反馈、队列和错误处理。
+- **坐标点击**：只有没有 UID 或视觉定位时才用 `clickAt`。
+- **输入文本**：优先 `typeText` 或 `fillForm`，不要在 `evaluateScript` 里直接设置 `input.value`，除非目标页面必须特殊处理框架状态。
+- **等待页面变化**：优先 `waitFor`；复杂等待可放在 `evaluateScript` 内，但不得替代已有简单等待工具。
+- **截图/人工协助**：优先 `takeScreenshot`、`requestHumanAssist`，不要自己用页面脚本截图。
+- **网络/控制台/调试**：优先 `listNetworkRequests`、`getNetworkResponseBody`、`listConsoleMessages`。
+- **何时允许 `evaluateScript`**：仅用于复杂数据抽取、站点特定解析、批量 DOM 聚合、或已有工具无法完成的逻辑。若脚本中需要点击/输入，必须优先拆回 `click` / `typeText` / `fillForm`；只有目标行为无法通过 UID 工具实现时才在脚本内点击。
+- **禁止绕过安全层**：不得用 `evaluateScript` 实现 `closePage`、读取 cookies/history、修改 profile/proxy、绕过确认门控等敏感操作。
 
 ### 0. 会话隔离与确认门控（硬性要求）
 - **所有带 `tabId` 的调用必须传入 `sessionId` 与 `owner`**。同一个标签页首次被某个 `sessionId` / `owner` 使用后，会在 RPC 层被锁定；其他会话或 owner 访问会被拒绝。
@@ -212,16 +227,17 @@ node <skill_dir>/scripts/cli.js <method> --stdin
 
 | 场景状态 | 最大允许调用步骤 | 推荐执行路径 |
 | :--- | :--- | :--- |
-| **无活跃标签页 + 目标 URL 已知** | 1. `createTab`（带 url 和任务名字 group） <br> 2. `evaluateScript` | 均通过 `--stdin` 格式，一次性完成创建并执行包含“等待+校验+操作”的完整脚本。 |
-| **已有活跃 `tabId` 或 页面已处于打开状态** | 1. `evaluateScript` | **直接执行业务脚本，拒绝任何前置 getTabs/ping 校验**。 |
-| **需复用标签页但完全无 `tabId` 且上下文未指明页面已打开** | 1. `getTabs`（仅限一次） <br> 2. `evaluateScript` | 先获取 `tabId`，再直接执行完整业务脚本。 |
+| **无活跃标签页 + 目标 URL 已知** | 1. `approveSensitiveOperation(createTab)` <br> 2. `createTab` <br> 3. `readPage` / `waitFor` / `click` / `typeText` | 创建后优先使用已有工具完成导航、点击、输入；复杂数据整理才用 `evaluateScript`。 |
+| **已有活跃 `tabId` 或 页面已处于打开状态** | 按任务最少必要工具调用 | **优先 `readPage` 获取 UID，再用 `click` / `typeText` / `fillForm`。不要直接用 `evaluateScript` 做点击输入。** |
+| **需复用标签页但完全无 `tabId` 且上下文未指明页面已打开** | 1. `getTabs`（仅限一次） <br> 2. `claimTab` <br> 3. 现有工具链 | 先获取并声明 tab 所有权，再优先使用现有工具。 |
 
-### 脚本内部逻辑规范
-你编写并传给 `evaluateScript` 的 JS 脚本必须是高内聚的自适应脚本，需在脚本内部实现：
+### `evaluateScript` 内部逻辑规范
+只有在确实需要 `evaluateScript` 时，脚本必须是高内聚的自适应脚本，需在脚本内部实现：
 - **🚫 字符编码安全（硬性红线）**：为防止远程传输、CLI 解析或平台间编码转换损坏脚本，**脚本内的所有非 ASCII 字符（如中文文本、中文正则表达式等）必须全部转换为 Unicode 转义序列（如 `\u4e00-\u9fa5`、`\uXXXX`）**。严禁在 `script` 字段中出现任何明文中文。
 - **自适应等待**：使用 `waitForSelector` 或基于 Promise 的自适应等待，**严禁**使用硬编码的固定 `sleep`。
 - **唯一性校验**：修改性操作前，必须在脚本内校验目标元素的唯一性，若匹配到多个，应在脚本内通过限定父容器或更精准的选择器来定位，**严禁默认点击第一个**。
 - **降级提取**：对未知第三方页面，脚本内按 `state/API -> DOM 结构 -> body.innerText` 进行降级兼容提取。
+- **避免内联交互**：除非已有工具无法完成，否则不要在脚本内调用 `.click()`、`dispatchEvent()`、直接改 `input.value`；优先返回候选元素信息，再用 `readPage` + `click` / `typeText` 执行。
 
 ---
 
