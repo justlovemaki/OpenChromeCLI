@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
+const { pathToFileURL } = require('url');
 const { execFileSync, spawn } = require('child_process');
 
 function findRootDir() {
@@ -30,10 +31,15 @@ Options:
   --cloakbrowser                Resolve the browser executable from CloakBrowser CLI
   --cloakbrowser-cli <value>    CloakBrowser CLI command. Default: auto (npx, then python)
   --profile <dir>               User data dir. Default: .browser-profiles/default
+  --fresh-profile               Create a new user data dir for this launch
   --extension <dir>             Extension dir to load. Default: dist, or bundled skill zip fallback
   --extra-extension <dir>       Additional extension dir. Can be repeated
   --url <url>                   Initial URL. Default: about:blank
   --proxy-server <value>        Browser proxy server, e.g. http://127.0.0.1:7890
+  --geoip                       CloakBrowser SDK mode: match timezone/locale to proxy IP
+  --humanize                    CloakBrowser SDK mode: human-like mouse, keyboard, scroll
+  --cloak-sdk                   Force CloakBrowser SDK persistent-context launch mode
+  --no-cloak-sdk                Disable SDK mode and launch CloakBrowser binary directly
   --remote-debugging-port <n>   Open CDP port. Default: disabled
   --window-size <w,h>           Browser window size, e.g. 1280,900
   --headless                    Start headless mode if supported by the browser
@@ -72,10 +78,15 @@ function parseArgs(argv) {
         else if (arg === '--cloakbrowser') options.cloakbrowser = true;
         else if (arg === '--cloakbrowser-cli') options.cloakbrowserCli = next();
         else if (arg === '--profile') options.profile = next();
+        else if (arg === '--fresh-profile') options.freshProfile = true;
         else if (arg === '--extension') options.extension = next();
         else if (arg === '--extra-extension') options.extraExtensions.push(next());
         else if (arg === '--url') options.url = next();
         else if (arg === '--proxy-server') options.proxyServer = next();
+        else if (arg === '--geoip') options.geoip = true;
+        else if (arg === '--humanize') options.humanize = true;
+        else if (arg === '--cloak-sdk') options.cloakSdk = true;
+        else if (arg === '--no-cloak-sdk') options.noCloakSdk = true;
         else if (arg === '--remote-debugging-port') options.remoteDebuggingPort = next();
         else if (arg === '--window-size') options.windowSize = next();
         else if (arg === '--headless') options.headless = true;
@@ -157,6 +168,15 @@ function resolveProfileDir(value) {
     const dir = path.resolve(rootDir, value);
     fs.mkdirSync(dir, { recursive: true });
     return dir;
+}
+
+function resolveLaunchProfileDir(options) {
+    if (!options.freshProfile) return resolveProfileDir(options.profile || '.browser-profiles/default');
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const suffix = `${stamp}-${process.pid}`;
+    const base = options.profile || '.browser-profiles/private';
+    return resolveProfileDir(`${base}-${suffix}`);
 }
 
 function quote(value) {
@@ -245,6 +265,28 @@ function resolveCloakBrowserExecutable(options) {
     throw new Error(`Unable to resolve CloakBrowser executable. Install cloakbrowser first or pass --browser manually. Attempts: ${errors.join(' | ')}`);
 }
 
+function resolveCloakBrowserImportSpecifier() {
+    const candidates = [
+        path.join(rootDir, 'node_modules', 'cloakbrowser', 'dist', 'index.js'),
+        path.join(path.dirname(process.execPath), 'node_modules', 'cloakbrowser', 'dist', 'index.js')
+    ];
+
+    try {
+        const globalRoot = execFileSync(commandName('npm'), ['root', '-g'], {
+            cwd: rootDir,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore']
+        }).trim();
+        if (globalRoot) candidates.push(path.join(globalRoot, 'cloakbrowser', 'dist', 'index.js'));
+    } catch {}
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return pathToFileURL(candidate).href;
+    }
+
+    throw new Error('CloakBrowser SDK module not found. Install the Node package with: npm install -g cloakbrowser playwright-core');
+}
+
 function loadBridgeConfig(options) {
     const configPath = path.join(rootDir, 'host', 'config.json');
     let config = {};
@@ -263,6 +305,63 @@ function loadBridgeConfig(options) {
         token: options.bridgeToken || config.token || process.env.SEO_TOKEN || 'bridge-relay-secure-token-2026',
         timeoutMs: Number(options.bridgeTimeout || 30000)
     };
+}
+
+function splitCommand(value) {
+    return String(value || '').split(/\s+/).filter(Boolean);
+}
+
+function buildCloakSdkOptions(options, profileDir, extensionDirs, browserArgs) {
+    return {
+        userDataDir: profileDir,
+        headless: options.headless === true ? true : false,
+        proxy: options.proxyServer || undefined,
+        geoip: !!options.geoip,
+        humanize: !!options.humanize,
+        extensionPaths: extensionDirs,
+        args: browserArgs.filter(arg => !arg.startsWith('--user-data-dir=') && !arg.startsWith('--load-extension=') && !arg.startsWith('--disable-extensions-except=')),
+        startUrl: options.url || 'about:blank'
+    };
+}
+
+function createCloakSdkLauncher(options, profileDir, extensionDirs, browserArgs) {
+    const launcherDir = path.join(rootDir, '.browser-profiles', '.launchers');
+    fs.mkdirSync(launcherDir, { recursive: true });
+    const launcherPath = path.join(launcherDir, `cloak-launch-${Date.now()}-${process.pid}.mjs`);
+    const sdkOptions = buildCloakSdkOptions(options, profileDir, extensionDirs, browserArgs);
+    const cloakImport = resolveCloakBrowserImportSpecifier();
+    const code = `
+import { launchPersistentContext } from ${JSON.stringify(cloakImport)};
+
+const options = ${JSON.stringify(sdkOptions, null, 2)};
+
+const context = await launchPersistentContext({
+  userDataDir: options.userDataDir,
+  headless: options.headless,
+  proxy: options.proxy,
+  geoip: options.geoip,
+  humanize: options.humanize,
+  extensionPaths: options.extensionPaths,
+  args: options.args
+});
+
+const page = context.pages()[0] || await context.newPage();
+if (options.startUrl && options.startUrl !== 'about:blank') {
+  await page.goto(options.startUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+}
+
+console.log(JSON.stringify({ status: 'started', pid: process.pid }));
+
+const shutdown = async () => {
+  try { await context.close(); } catch {}
+  process.exit(0);
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+setInterval(() => {}, 1 << 30);
+`;
+    fs.writeFileSync(launcherPath, code, 'utf8');
+    return launcherPath;
 }
 
 function queryBridgePort(host, port, token, timeoutMs = 800) {
@@ -351,14 +450,17 @@ async function main() {
     }
 
     if (!options.browser && !options.cloakbrowser) throw new Error('Missing required --browser or --cloakbrowser');
-    const browserPath = options.cloakbrowser
-        ? resolveCloakBrowserExecutable(options)
-        : path.resolve(rootDir, options.browser);
-    if (!fs.existsSync(browserPath) || !fs.statSync(browserPath).isFile()) {
+    const useCloakSdk = options.cloakbrowser && !options.noCloakSdk;
+    const browserPath = useCloakSdk
+        ? ''
+        : options.cloakbrowser
+            ? resolveCloakBrowserExecutable(options)
+            : path.resolve(rootDir, options.browser);
+    if (!useCloakSdk && (!fs.existsSync(browserPath) || !fs.statSync(browserPath).isFile())) {
         throw new Error(`Browser executable does not exist: ${browserPath}`);
     }
 
-    const profileDir = resolveProfileDir(options.profile || '.browser-profiles/default');
+    const profileDir = resolveLaunchProfileDir(options);
     const extensionDirs = [
         resolveExtensionDir(options.extension),
         ...options.extraExtensions.map(dir => resolveExistingDir(dir, 'Extra extension directory'))
@@ -372,12 +474,12 @@ async function main() {
         '--no-default-browser-check'
     ];
 
-    if (options.proxyServer) browserArgs.push(`--proxy-server=${options.proxyServer}`);
+    if (options.proxyServer && !useCloakSdk) browserArgs.push(`--proxy-server=${options.proxyServer}`);
     if (options.remoteDebuggingPort) browserArgs.push(`--remote-debugging-port=${options.remoteDebuggingPort}`);
     if (options.windowSize) browserArgs.push(`--window-size=${options.windowSize}`);
-    if (options.headless) browserArgs.push('--headless=new');
+    if (options.headless && !useCloakSdk) browserArgs.push('--headless=new');
     browserArgs.push(...options.args);
-    browserArgs.push(options.url || 'about:blank');
+    if (!useCloakSdk) browserArgs.push(options.url || 'about:blank');
 
     const bridgeConfig = loadBridgeConfig(options);
     const bridgePortsBefore = options.waitBridgePort && !options.dryRun
@@ -385,11 +487,22 @@ async function main() {
         : [];
 
     console.log('Launching browser:');
-    console.log([quote(browserPath), ...browserArgs.map(quote)].join(' '));
+    if (useCloakSdk) {
+        const launcherPath = createCloakSdkLauncher(options, profileDir, extensionDirs, browserArgs);
+        console.log([quote(process.execPath), quote(launcherPath)].join(' '));
+    } else {
+        console.log([quote(browserPath), ...browserArgs.map(quote)].join(' '));
+    }
 
     if (options.dryRun) return;
 
-    const child = spawn(browserPath, browserArgs, {
+    const child = useCloakSdk
+        ? spawn(process.execPath, [createCloakSdkLauncher(options, profileDir, extensionDirs, browserArgs)], {
+            detached: true,
+            stdio: 'ignore',
+            cwd: rootDir
+        })
+        : spawn(browserPath, browserArgs, {
         detached: true,
         stdio: 'ignore'
     });
@@ -397,6 +510,9 @@ async function main() {
     console.log(`Started browser process PID: ${child.pid}`);
     console.log(`Profile: ${profileDir}`);
     console.log(`Loaded extensions: ${extensionDirs.join(', ')}`);
+    if (useCloakSdk) {
+        console.log(`CloakBrowser SDK flags: proxy=${options.proxyServer ? 'set' : 'none'}, geoip=${!!options.geoip}, headless=${!!options.headless}, humanize=${!!options.humanize}`);
+    }
 
     if (options.waitBridgePort) {
         console.log('Waiting for bridge port...');

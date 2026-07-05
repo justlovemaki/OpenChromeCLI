@@ -55,13 +55,18 @@ description: Use when an AI agent needs to automate a real browser through Agent
 
 ### 0.1 隐私模式：先启动指纹浏览器并绑定桥接端口
 - **仅当用户明确要求“隐私模式 / privacy mode / 指纹浏览器 / 隔离浏览器 / 新身份”时，才执行本流程**。普通真实 Chrome 控制不需要启动指纹浏览器。
-- **隐私模式依赖 CloakBrowser**。执行隐私模式前必须确认环境已安装 CloakBrowser 的 Python 或 Node CLI；未安装时必须提示用户先安装 `npm install -g cloakbrowser` 或 `pip install cloakbrowser`，不得继续用默认 Chrome 或默认端口替代。
-- 隐私模式下，业务操作前必须先运行 `launch-fingerprint-browser.js --cloakbrowser` 启动 CloakBrowser，并使用 `--wait-bridge-port` 获取该浏览器插件实例的桥接端口。
+- **隐私模式依赖 CloakBrowser**。执行隐私模式前必须确认环境已安装 CloakBrowser 的 Python 或 Node CLI；推荐安装 Node SDK 依赖：`npm install -g cloakbrowser playwright-core mmdb-lib`。未安装时必须提示用户先安装，不得继续用默认 Chrome 或默认端口替代。
+- 隐私模式下，业务操作前必须先运行 `launch-fingerprint-browser.js --cloakbrowser` 启动 CloakBrowser，并使用 `--wait-bridge-port` 获取该浏览器插件实例的桥接端口。`--cloakbrowser` 默认使用 CloakBrowser SDK persistent context，以支持 `proxy`、`geoip`、`headless`、`humanize` 和扩展加载。
+- **隐私模式默认每次使用全新 profile**：必须传 `--fresh-profile`，让脚本为本次任务创建新的用户数据目录，避免复用 Cookie、缓存、本地存储和登录状态。只有用户明确要求“固定身份 / 复用账号 / 复用 profile”时，才允许改用固定 `--profile <dir>` 且不传 `--fresh-profile`。
 - skill 内置 `assets/bridge-extension.zip`。当脚本在独立 skill 环境中找不到项目根目录的 `dist` 插件目录时，会自动解压该 zip 并加载插件；不要手动改用默认 Chrome。
 - 获取到 `bridgePort` 后，后续所有 `cli.js` 调用必须显式使用该端口连接该浏览器实例，避免误连默认 Chrome。
 - **启动示例**：
   ```bash
-  node <skill_dir>/scripts/launch-fingerprint-browser.js --cloakbrowser --profile .browser-profiles/<sessionId> --url "https://example.com" --wait-bridge-port
+  node <skill_dir>/scripts/launch-fingerprint-browser.js --cloakbrowser --fresh-profile --url "https://example.com" --wait-bridge-port
+  ```
+- **反机器人网站推荐启动示例**：如果用户提供住宅代理，必须把代理传给 `--proxy-server`，并启用 `--geoip --humanize`；默认保持有头模式，不加 `--headless`：
+  ```bash
+  node <skill_dir>/scripts/launch-fingerprint-browser.js --cloakbrowser --fresh-profile --url "https://example.com" --proxy-server "http://user:pass@residential-proxy:port" --geoip --humanize --wait-bridge-port
   ```
 - **高级手动模式**：仅当用户明确提供其他兼容 Chromium 参数的指纹浏览器可执行文件时，才允许用 `--browser`：
   ```bash
@@ -99,6 +104,27 @@ description: Use when an AI agent needs to automate a real browser through Agent
     "owner": "agent-a"
   }
   ```
+
+### 0.3 非扫码登录：从 `.env` 读取账号配置
+- 当页面提供邮箱、用户名、账号、手机号、密码等非扫码登录方式时，必须先读取 `.env` 中的配置，不要向用户索要已配置的凭据。
+- 使用脚本读取配置：
+  ```bash
+  node <skill_dir>/scripts/read-login-env.js --site <site>
+  ```
+- 如果 `.env` 不在项目根目录，必须通过 `--env-file <path>` 指定：
+  ```bash
+  node <skill_dir>/scripts/read-login-env.js --site <site> --env-file "<path-to-env>"
+  ```
+- 真正填表前如需密码明文，才允许使用：
+  ```bash
+  node <skill_dir>/scripts/read-login-env.js --site <site> --reveal-secret
+  ```
+- 脚本会先加载 `.env`，再读取环境变量；当前进程已有同名环境变量时，以当前进程环境变量为准。
+- 支持通用环境变量：`LOGIN_EMAIL`、`LOGIN_USERNAME`、`LOGIN_ACCOUNT`、`LOGIN_PASSWORD`、`BROWSER_LOGIN_EMAIL`、`BROWSER_LOGIN_USERNAME`、`BROWSER_LOGIN_ACCOUNT`、`BROWSER_LOGIN_PASSWORD`。
+- 支持站点前缀环境变量：`<PREFIX>_EMAIL`、`<PREFIX>_USERNAME`、`<PREFIX>_ACCOUNT`、`<PREFIX>_PASSWORD`。例如 `--site xhs` 会优先读取 `XHS_EMAIL`、`XHS_USERNAME`、`XHS_ACCOUNT`、`XHS_PASSWORD`。
+- 字段选择规则：页面是邮箱登录时优先用 `email`；用户名/账号登录时优先用 `username`，其次 `account`，再其次 `email`；密码字段使用 `password`。
+- 凭据安全规则：严禁在回复中展示密码、Token、完整账号；最多只说明“已读取登录配置”或“缺少 LOGIN_PASSWORD / XHS_PASSWORD”。
+- 如果环境变量缺失，必须明确指出缺少哪个变量，并停止非扫码登录流程；不得猜测、不得硬编码凭据。
 
 ### 1. `createTab` 方法（强制双参数）
 - **参数定义**：`createTab(url, group)`

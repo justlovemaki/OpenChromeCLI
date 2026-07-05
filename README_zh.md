@@ -62,7 +62,7 @@ Native Host 是实现 Agent 与 Chrome 安全通信的关键组件。
 安装方式任选其一：
 
 ```bash
-npm install -g cloakbrowser
+npm install -g cloakbrowser playwright-core mmdb-lib
 ```
 
 或：
@@ -74,7 +74,13 @@ pip install cloakbrowser
 安装后可以用 `--cloakbrowser` 启动独立浏览器配置，并自动加载本项目插件：
 
 ```bash
-node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --cloakbrowser --profile .browser-profiles/xhs --url https://www.xiaohongshu.com --wait-bridge-port
+node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --cloakbrowser --fresh-profile --url https://www.xiaohongshu.com --wait-bridge-port
+```
+
+面对有反机器人保护的网站，建议使用住宅代理并启用 CloakBrowser SDK flags：
+
+```bash
+node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --cloakbrowser --fresh-profile --url https://www.xiaohongshu.com --proxy-server "http://user:pass@residential-proxy:port" --geoip --humanize --wait-bridge-port
 ```
 
 如果你的其他指纹浏览器兼容 Chromium 启动参数，也可以手动指定浏览器可执行文件：
@@ -100,10 +106,14 @@ node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --cloak
 - `--cloakbrowser`：自动从 CloakBrowser CLI 解析 Chromium 可执行文件路径，使用该参数时无需传 `--browser`。
 - `--cloakbrowser-cli`：指定 CloakBrowser CLI 命令，默认自动尝试 `npx cloakbrowser`、`python -m cloakbrowser`、`python3 -m cloakbrowser`。
 - `--profile`：独立用户数据目录，默认 `.browser-profiles/default`。
+- `--fresh-profile`：每次启动都创建新的用户数据目录。隐私模式推荐开启，避免复用 Cookie、缓存和本地存储。
 - `--extension`：要加载的插件目录，默认 `dist`。
 - 独立 skill 场景下，如果找不到项目根目录的 `dist`，脚本会自动解压 `skills/browser-remote-control/assets/bridge-extension.zip` 作为插件目录。
 - `--extra-extension`：额外插件目录，可重复传入。
 - `--proxy-server`：代理地址，例如 `http://127.0.0.1:7890`。
+- `--geoip`：CloakBrowser SDK 模式下根据代理 IP 匹配 timezone/locale。
+- `--humanize`：CloakBrowser SDK 模式下启用拟人化鼠标、键盘、滚动。
+- `--cloak-sdk` / `--no-cloak-sdk`：强制开启或关闭 CloakBrowser SDK persistent context 启动模式；`--cloakbrowser` 默认使用 SDK 模式。
 - `--remote-debugging-port`：打开 CDP 端口，例如 `9222`。
 - `--arg`：传递额外浏览器参数，可重复传入。
 - `--wait-bridge-port`：启动后等待插件 Native Host 就绪，并输出桥接端口。
@@ -113,6 +123,45 @@ node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --cloak
 - `--bridge-timeout`：等待桥接端口超时时间，默认 `30000` 毫秒。
 
 > 注意：脚本通过 `--load-extension` 加载插件。部分商业指纹浏览器会屏蔽或改写 Chromium 参数，这种情况下需要改用该浏览器官方的启动/API 方式。
+
+### 4. 非扫码登录 `.env` 配置
+如果目标网站支持邮箱、用户名、账号、手机号、密码等非扫码登录方式，可以通过 `.env` 提供凭据，Agent 会从 skill 脚本读取，不需要在对话中输入密码。
+
+`.env` 示例，通用变量：
+
+```bash
+LOGIN_EMAIL="user@example.com"
+LOGIN_USERNAME="username"
+LOGIN_ACCOUNT="account-or-phone"
+LOGIN_PASSWORD="password"
+```
+
+也支持站点前缀变量，例如小红书：
+
+```bash
+XHS_ACCOUNT="account-or-phone"
+XHS_PASSWORD="password"
+```
+
+读取配置时脚本会自动加载项目根目录、当前目录或 skill 目录附近的 `.env`：
+
+```bash
+node skills/browser-remote-control/scripts/read-login-env.js --site xhs
+```
+
+如果 `.env` 在其他路径：
+
+```bash
+node skills/browser-remote-control/scripts/read-login-env.js --site xhs --env-file "D:\\secure\\login.env"
+```
+
+填表前读取密码明文：
+
+```bash
+node skills/browser-remote-control/scripts/read-login-env.js --site xhs --reveal-secret
+```
+
+> 安全提示：默认输出会隐藏密码；只有执行填表动作前才使用 `--reveal-secret`，不要在回复中展示密码。
 
 ## 🤖 在 AI Agent 中使用
 

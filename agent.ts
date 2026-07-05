@@ -279,6 +279,50 @@ export const Agent: any = {
         }
     },
 
+    humanDelay(min = 40, max = 140) {
+        const span = Math.max(0, max - min);
+        return new Promise(r => setTimeout(r, min + Math.random() * span));
+    },
+
+    jitterPoint(x, y, width = 0, height = 0) {
+        const maxX = Math.max(1, Math.min(12, Math.abs(width) * 0.25));
+        const maxY = Math.max(1, Math.min(10, Math.abs(height) * 0.25));
+        return {
+            x: Math.round(x + (Math.random() - 0.5) * maxX),
+            y: Math.round(y + (Math.random() - 0.5) * maxY)
+        };
+    },
+
+    async humanMoveMouse(tabId, from, to, options: { button?: string; steps?: number } = {}) {
+        const steps = options.steps || Math.max(8, Math.min(28, Math.round(Math.hypot(to.x - from.x, to.y - from.y) / 35)));
+        const control = {
+            x: (from.x + to.x) / 2 + (Math.random() - 0.5) * 80,
+            y: (from.y + to.y) / 2 + (Math.random() - 0.5) * 60
+        };
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            const ease = t * t * (3 - 2 * t);
+            const x = Math.round((1 - ease) * (1 - ease) * from.x + 2 * (1 - ease) * ease * control.x + ease * ease * to.x + (Math.random() - 0.5) * 1.8);
+            const y = Math.round((1 - ease) * (1 - ease) * from.y + 2 * (1 - ease) * ease * control.y + ease * ease * to.y + (Math.random() - 0.5) * 1.8);
+            await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: options.button || "none" });
+            await this.humanDelay(8, 24);
+        }
+    },
+
+    async humanClickAt(tabId, x, y, options: { clickCount?: number; width?: number; height?: number } = {}) {
+        const target = this.jitterPoint(x, y, options.width || 0, options.height || 0);
+        const start = {
+            x: Math.max(1, Math.round(target.x + (Math.random() - 0.5) * 220)),
+            y: Math.max(1, Math.round(target.y + (Math.random() - 0.5) * 160))
+        };
+        await this.humanMoveMouse(tabId, start, target);
+        await this.humanDelay(45, 180);
+        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: target.x, y: target.y, button: "left", clickCount: options.clickCount || 1 });
+        await this.humanDelay(55, 150);
+        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: target.x, y: target.y, button: "left", clickCount: options.clickCount || 1 });
+        return target;
+    },
+
     async detachDebugger(tabId) {
         return new Promise((resolve) => {
             if (this.debuggerSessions[tabId]) delete this.debuggerSessions[tabId];
@@ -456,19 +500,15 @@ export const Agent: any = {
         }
 
         // 1. 显示视觉反馈
-        await this.showVisualAction(tabId, { x, y }, 'click');
+        const visualPoint = this.jitterPoint(x, y, meta.width, meta.height);
+        await this.showVisualAction(tabId, visualPoint, 'click');
 
         // 2. 执行物理点击 (按下 + 抬起)
         const clickCount = options.dblClick ? 2 : 1;
         
         try {
-            await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
-                type: "mousePressed", x, y, button: "left", clickCount
-            });
-            await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
-                type: "mouseReleased", x, y, button: "left", clickCount
-            });
-            return { success: true, x, y, method: "cdp" };
+            const clicked = await this.humanClickAt(tabId, x, y, { clickCount, width: meta.width, height: meta.height });
+            return { success: true, x: clicked.x, y: clicked.y, method: "cdp-humanized" };
         } catch (cdpErr) {
             // CDP 失败时，最后尝试一次 JS 点击
             const jsResult = await this.executeScript(tabId, {
@@ -546,10 +586,11 @@ export const Agent: any = {
             await this.sendCDP(tabId, "Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 8, key: "Backspace" });
 
             // 3. 模拟真实输入
-            await this.cdpInsertText(tabId, item.value);
+            await this.humanDelay(120, 320);
+            await this.cdpType(tabId, item.value);
             
             // 4. 给一点点喘息时间，让前端框架响应变更
-            await new Promise(r => setTimeout(r, 100));
+            await this.humanDelay(160, 380);
         }
         return { success: true, count: elements.length };
     },
@@ -789,11 +830,12 @@ export const Agent: any = {
             throw new Error(`Could not determine valid coordinates for UID "${uid}".`);
         }
 
-        await this.showVisualAction(tabId, { x, y }, 'hover');
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", {
-            type: "mouseMoved",
-            x, y
-        });
+        const target = this.jitterPoint(x, y, meta.width, meta.height);
+        await this.showVisualAction(tabId, target, 'hover');
+        await this.humanMoveMouse(tabId, {
+            x: Math.max(1, Math.round(target.x + (Math.random() - 0.5) * 180)),
+            y: Math.max(1, Math.round(target.y + (Math.random() - 0.5) * 120))
+        }, target);
         return { success: true };
     },
 
@@ -886,16 +928,18 @@ export const Agent: any = {
         const from = cache.refMeta[fromUid];
         const to = cache.refMeta[toUid];
         
-        const fx = Math.round(from.x + from.width / 2);
-        const fy = Math.round(from.y + from.height / 2);
-        const tx = Math.round(to.x + to.width / 2);
-        const ty = Math.round(to.y + to.height / 2);
+        const fromPoint = this.jitterPoint(Math.round(from.x + from.width / 2), Math.round(from.y + from.height / 2), from.width, from.height);
+        const toPoint = this.jitterPoint(Math.round(to.x + to.width / 2), Math.round(to.y + to.height / 2), to.width, to.height);
 
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: fx, y: fy });
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: fx, y: fy, button: "left", clickCount: 1 });
-        // 模拟平滑移动
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: tx, y: ty, button: "left" });
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: tx, y: ty, button: "left", clickCount: 1 });
+        await this.humanMoveMouse(tabId, {
+            x: Math.max(1, Math.round(fromPoint.x + (Math.random() - 0.5) * 160)),
+            y: Math.max(1, Math.round(fromPoint.y + (Math.random() - 0.5) * 120))
+        }, fromPoint);
+        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: fromPoint.x, y: fromPoint.y, button: "left", clickCount: 1 });
+        await this.humanDelay(120, 260);
+        await this.humanMoveMouse(tabId, fromPoint, toPoint, { button: "left", steps: 18 + Math.floor(Math.random() * 14) });
+        await this.humanDelay(80, 180);
+        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: toPoint.x, y: toPoint.y, button: "left", clickCount: 1 });
         
         return { success: true };
     },
@@ -929,9 +973,9 @@ export const Agent: any = {
      * 纯坐标点击
      */
     async clickAt(tabId: number, x: number, y: number) {
-        await this.showVisualAction(tabId, { x, y }, 'click');
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-        await this.sendCDP(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+        const target = this.jitterPoint(x, y, 8, 8);
+        await this.showVisualAction(tabId, target, 'click');
+        await this.humanClickAt(tabId, x, y, { clickCount: 1, width: 8, height: 8 });
         return { success: true };
     },
 
