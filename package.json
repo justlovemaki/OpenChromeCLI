@@ -1,6 +1,6 @@
 {
   "name": "bridge-extension",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Standalone build for Bridge Extension",
   "main": "background.js",
   "scripts": {
