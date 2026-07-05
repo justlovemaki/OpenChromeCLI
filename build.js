@@ -153,6 +153,9 @@ async function build() {
         cwd: DIST_DIR,
         nodir: true,
         ignore: [
+            'skills/**',
+            'icons/**',
+            'host/**',
             'skills/browser-remote-control/assets/bridge-extension.zip'
         ]
     });
