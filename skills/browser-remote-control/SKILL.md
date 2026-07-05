@@ -26,14 +26,91 @@ description: Use when an AI agent needs to automate a real browser through Agent
 
 所有方法必须使用严格的**驼峰命名**，且参数必须严格匹配以下 Schema 结构，**严禁遗漏任何必填参数**：
 
+### 0. 会话隔离与确认门控（硬性要求）
+- **所有带 `tabId` 的调用必须传入 `sessionId` 与 `owner`**。同一个标签页首次被某个 `sessionId` / `owner` 使用后，会在 RPC 层被锁定；其他会话或 owner 访问会被拒绝。
+- **同一 `tabId` 的操作由 RPC 层串行执行**，同一浏览器内可并行运行多个 session，但同一标签页不会被并发交叉操作。
+- **已有标签页必须先声明所有权**：
+  ```json
+  {
+    "tabId": 123,
+    "sessionId": "task-a",
+    "owner": "agent-a"
+  }
+  ```
+  方法：`claimTab`。
+- **敏感操作必须先获取一次性确认 token**，方法：`approveSensitiveOperation`。必须传入 `approval: "approve"`，返回的 `confirmToken` 只能使用一次，不会跨操作继承。
+- **敏感操作范围**：`createTab`、`closePage`、`finalizeTabs`、`releaseTab`、`getCookies`、`getUserHistory`、`emulateDevice`、`executeCdp`、`takeHeapSnapshot`。
+- **确认示例**：
+  ```json
+  {
+    "method": "closePage",
+    "approval": "approve",
+    "tabId": 123,
+    "sessionId": "task-a",
+    "owner": "agent-a",
+    "reason": "用户要求关闭任务标签页"
+  }
+  ```
+  随后在 `closePage` 参数中带上返回的 `confirmToken`。
+
+### 0.1 隐私模式：先启动指纹浏览器并绑定桥接端口
+- **仅当用户明确要求“隐私模式 / privacy mode / 指纹浏览器 / 隔离浏览器 / 新身份”时，才执行本流程**。普通真实 Chrome 控制不需要启动指纹浏览器。
+- **隐私模式依赖 CloakBrowser**。执行隐私模式前必须确认环境已安装 CloakBrowser 的 Python 或 Node CLI；未安装时必须提示用户先安装 `npm install -g cloakbrowser` 或 `pip install cloakbrowser`，不得继续用默认 Chrome 或默认端口替代。
+- 隐私模式下，业务操作前必须先运行 `launch-fingerprint-browser.js --cloakbrowser` 启动 CloakBrowser，并使用 `--wait-bridge-port` 获取该浏览器插件实例的桥接端口。
+- skill 内置 `assets/bridge-extension.zip`。当脚本在独立 skill 环境中找不到项目根目录的 `dist` 插件目录时，会自动解压该 zip 并加载插件；不要手动改用默认 Chrome。
+- 获取到 `bridgePort` 后，后续所有 `cli.js` 调用必须显式使用该端口连接该浏览器实例，避免误连默认 Chrome。
+- **启动示例**：
+  ```bash
+  node <skill_dir>/scripts/launch-fingerprint-browser.js --cloakbrowser --profile .browser-profiles/<sessionId> --url "https://example.com" --wait-bridge-port
+  ```
+- **高级手动模式**：仅当用户明确提供其他兼容 Chromium 参数的指纹浏览器可执行文件时，才允许用 `--browser`：
+  ```bash
+  node <skill_dir>/scripts/launch-fingerprint-browser.js --browser "<fingerprint-browser-executable>" --profile .browser-profiles/<sessionId> --url "https://example.com" --wait-bridge-port
+  ```
+- **后续 CLI 连接示例**：
+  ```bash
+  node <skill_dir>/scripts/cli.js <method> --params-file <file> --host 127.0.0.1 --port <bridgePort>
+  ```
+- 隐私模式启动后仍必须遵守 `sessionId`、`owner`、`claimTab`、敏感操作 `confirmToken` 和人工协助流程。
+- 如果 `--wait-bridge-port` 超时或未返回 `bridgePort`，必须报告“指纹浏览器已启动但插件桥接端口未就绪”，不要继续用默认端口执行任务。
+
+### 0.2 二维码登录与人工协助流程
+- 当页面出现二维码登录、MFA、短信验证、设备确认等必须人类完成的步骤时，必须调用 `requestHumanAssist`，返回当前页面截图和 `assistToken` 给用户。
+- **必须直接展示二维码截图**：`requestHumanAssist` 返回 `markdownImage`、`imageDataUrl`、`imageBase64`。回复用户时必须优先原样输出 `markdownImage`；如果渲染环境不支持 Markdown 图片，则输出 `imageDataUrl`。严禁只回复“请扫码”而不展示图片。
+- `requestHumanAssist` 会保持当前 `tabId` 的 session ownership，不释放标签页；同一标签页的后续 Agent 操作仍会被串行队列保护。
+- 用户完成扫码或验证后，必须调用 `confirmHumanAssist`，参数包含原 `assistToken`、`tabId`、`sessionId`、`owner`。
+- `confirmHumanAssist` 返回 `retry: true` 后，Agent 必须重试原先失败或被阻断的业务脚本，而不是新开标签页或重置页面。
+- **请求截图示例**：
+  ```json
+  {
+    "tabId": 123,
+    "sessionId": "task-a",
+    "owner": "agent-a",
+    "type": "qr-login",
+    "message": "请扫码登录，完成后回复已确认"
+  }
+  ```
+- **扫码确认示例**：
+  ```json
+  {
+    "assistToken": "assist-...",
+    "tabId": 123,
+    "sessionId": "task-a",
+    "owner": "agent-a"
+  }
+  ```
+
 ### 1. `createTab` 方法（强制双参数）
 - **参数定义**：`createTab(url, group)`
-- **说明**：创建标签页。第一个参数为 `url`；**第二个参数为 `group`（当前的任务/分组名字，例如 "微博数据抓取" 等，必须传入）**。
+- **说明**：创建标签页。第一个参数为 `url`；**第二个参数为 `group`（当前的任务/分组名字，例如 "微博数据抓取" 等，必须传入）**。此方法属于敏感操作，必须先通过 `approveSensitiveOperation` 获取一次性 `confirmToken`。
 - **`--stdin` 格式 JSON (首选)**：
   ```json
   {
     "url": "https://example.com",
-    "group": "当前任务名字"
+    "group": "当前任务名字",
+    "sessionId": "当前任务ID",
+    "owner": "当前Agent名字",
+    "confirmToken": "一次性确认token"
   }
   ```
 - **备用方案（位置参数）**：
@@ -47,16 +124,22 @@ description: Use when an AI agent needs to automate a real browser through Agent
   ```json
   {
     "tabId": 123,
+    "sessionId": "当前任务ID",
+    "owner": "当前Agent名字",
     "script": "return document.title"
   }
   ```
 
 ### 3. `closePage` 方法
 - **参数定义**：`closePage(tabId)`
+- **说明**：敏感操作，必须先通过 `approveSensitiveOperation` 获取一次性 `confirmToken`。
 - **`--stdin` 格式 JSON (首选)**：
   ```json
   {
-    "tabId": 123
+    "tabId": 123,
+    "sessionId": "当前任务ID",
+    "owner": "当前Agent名字",
+    "confirmToken": "一次性确认token"
   }
   ```
 
@@ -134,4 +217,3 @@ node <skill_dir>/scripts/cli.js <method> --stdin
 1. **业务导向**：向用户反馈时，只描述业务动作和最终结果。
 2. **信息脱敏**：严禁在回复中泄露任何技术实现细节，包括但不限于：IP 地址、端口、Token、`cli.js` 路径、临时文件路径、或原始命令行参数。
 3. **禁止推卸规则**：不要向用户提及系统规则限制（如“根据规则，我不进行预检...”），保持专业和自然的交互。
-

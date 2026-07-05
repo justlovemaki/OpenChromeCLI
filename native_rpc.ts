@@ -1,5 +1,271 @@
 import { Agent } from './agent.js';
 
+type SessionScopedParams = {
+    tabId?: number;
+    sessionId?: string;
+    session_id?: string;
+    owner?: string;
+    ownerId?: string;
+    confirmToken?: string;
+    [key: string]: any;
+};
+
+type SessionState = {
+    id: string;
+    owner: string;
+    name?: string;
+    createdAt: number;
+    updatedAt: number;
+    tabs: Set<number>;
+};
+
+type TabOwnership = {
+    tabId: number;
+    sessionId: string;
+    owner: string;
+    createdAt: number;
+    updatedAt: number;
+};
+
+type ConfirmationGrant = {
+    method: string;
+    tabId?: number;
+    sessionId: string;
+    owner: string;
+    reason: string;
+    expiresAt: number;
+};
+
+type HumanAssistRequest = {
+    token: string;
+    type: string;
+    tabId: number;
+    sessionId: string;
+    owner: string;
+    message: string;
+    createdAt: number;
+    confirmedAt?: number;
+    status: "pending" | "confirmed";
+};
+
+class SessionCoordinator {
+    private sessions: Map<string, SessionState> = new Map();
+    private tabOwnership: Map<number, TabOwnership> = new Map();
+    private queues: Map<string, Promise<void>> = new Map();
+    private confirmations: Map<string, ConfirmationGrant> = new Map();
+    private humanAssists: Map<string, HumanAssistRequest> = new Map();
+
+    normalizeSessionId(params?: SessionScopedParams) {
+        const raw = params?.sessionId || params?.session_id || params?.group || params?.name || "default";
+        return String(raw || "default").trim() || "default";
+    }
+
+    normalizeOwner(params?: SessionScopedParams) {
+        const raw = params?.owner || params?.ownerId || "default-owner";
+        return String(raw || "default-owner").trim() || "default-owner";
+    }
+
+    ensureSession(params?: SessionScopedParams) {
+        const id = this.normalizeSessionId(params);
+        const owner = this.normalizeOwner(params);
+        const now = Date.now();
+        let session = this.sessions.get(id);
+
+        if (!session) {
+            session = { id, owner, createdAt: now, updatedAt: now, tabs: new Set<number>() };
+            this.sessions.set(id, session);
+        } else if (session.owner !== owner) {
+            throw new Error(`Session "${id}" is owned by "${session.owner}" and cannot be used by "${owner}".`);
+        } else {
+            session.updatedAt = now;
+        }
+
+        return session;
+    }
+
+    nameSession(params: SessionScopedParams) {
+        const session = this.ensureSession(params);
+        session.name = params.name || session.name;
+        session.updatedAt = Date.now();
+        return session;
+    }
+
+    claimTab(tabId: number, params?: SessionScopedParams) {
+        if (!tabId) throw new Error("Missing tabId");
+        const session = this.ensureSession(params);
+        const owner = this.normalizeOwner(params);
+        const existing = this.tabOwnership.get(tabId);
+        const now = Date.now();
+
+        if (existing && (existing.sessionId !== session.id || existing.owner !== owner)) {
+            throw new Error(`Tab ${tabId} is owned by session "${existing.sessionId}" / owner "${existing.owner}".`);
+        }
+
+        this.tabOwnership.set(tabId, { tabId, sessionId: session.id, owner, createdAt: existing?.createdAt || now, updatedAt: now });
+        session.tabs.add(tabId);
+        session.updatedAt = now;
+    }
+
+    assertTabAccess(tabId: number, params?: SessionScopedParams) {
+        if (!tabId) throw new Error("Missing tabId");
+        const existing = this.tabOwnership.get(tabId);
+        if (!existing) {
+            this.claimTab(tabId, params);
+            return;
+        }
+
+        const sessionId = this.normalizeSessionId(params);
+        const owner = this.normalizeOwner(params);
+        if (existing.sessionId !== sessionId || existing.owner !== owner) {
+            throw new Error(`Tab ${tabId} is owned by session "${existing.sessionId}" / owner "${existing.owner}".`);
+        }
+        existing.updatedAt = Date.now();
+    }
+
+    releaseTab(tabId: number) {
+        const existing = this.tabOwnership.get(tabId);
+        if (existing) {
+            this.sessions.get(existing.sessionId)?.tabs.delete(tabId);
+        }
+        this.tabOwnership.delete(tabId);
+    }
+
+    queueKey(params?: SessionScopedParams) {
+        return params?.tabId ? `tab:${params.tabId}` : `session:${this.normalizeSessionId(params)}`;
+    }
+
+    async runExclusive<T>(params: SessionScopedParams | undefined, task: () => Promise<T> | T): Promise<T> {
+        const key = this.queueKey(params);
+        const previous = this.queues.get(key) || Promise.resolve();
+        const run = previous.catch(() => {}).then(task);
+        this.queues.set(key, run.catch(() => {}).then(() => {}));
+        return await run;
+    }
+
+    approveSensitiveOperation(params: SessionScopedParams & { method?: string; approval?: string; reason?: string }) {
+        const method = String(params.method || "").trim();
+        if (!method) throw new Error("Missing method for sensitive operation approval");
+        if (String(params.approval || "").trim() !== "approve") {
+            throw new Error('Sensitive operation approval requires approval: "approve".');
+        }
+
+        const session = this.ensureSession(params);
+        const owner = this.normalizeOwner(params);
+        const token = `confirm-${crypto.randomUUID()}`;
+        const grant: ConfirmationGrant = {
+            method,
+            tabId: params.tabId,
+            sessionId: session.id,
+            owner,
+            reason: String(params.reason || ""),
+            expiresAt: Date.now() + 5 * 60 * 1000
+        };
+        this.confirmations.set(token, grant);
+        return { confirmToken: token, method, expiresAt: grant.expiresAt, oneTimeUse: true };
+    }
+
+    requireConfirmation(method: string, params?: SessionScopedParams) {
+        const token = String(params?.confirmToken || "");
+        if (!token) {
+            throw new Error(`Sensitive operation "${method}" requires a one-time confirmToken from approveSensitiveOperation.`);
+        }
+
+        const grant = this.confirmations.get(token);
+        this.confirmations.delete(token);
+        if (!grant) throw new Error("Confirmation token is invalid or already used.");
+        if (grant.expiresAt < Date.now()) throw new Error("Confirmation token expired.");
+        if (grant.method !== method) throw new Error(`Confirmation token is for "${grant.method}", not "${method}".`);
+
+        const sessionId = this.normalizeSessionId(params);
+        const owner = this.normalizeOwner(params);
+        if (grant.sessionId !== sessionId || grant.owner !== owner) {
+            throw new Error("Confirmation token scope does not match session/owner.");
+        }
+        if (grant.tabId !== undefined && params?.tabId !== grant.tabId) {
+            throw new Error("Confirmation token scope does not match tabId.");
+        }
+    }
+
+    createHumanAssist(params: SessionScopedParams & { type?: string; message?: string }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        this.assertTabAccess(params.tabId, params);
+        const sessionId = this.normalizeSessionId(params);
+        const owner = this.normalizeOwner(params);
+        const token = `assist-${crypto.randomUUID()}`;
+        const request: HumanAssistRequest = {
+            token,
+            type: params.type || "qr-login",
+            tabId: params.tabId,
+            sessionId,
+            owner,
+            message: params.message || "Human assistance required.",
+            createdAt: Date.now(),
+            status: "pending"
+        };
+        this.humanAssists.set(token, request);
+        return request;
+    }
+
+    confirmHumanAssist(params: SessionScopedParams & { assistToken?: string }) {
+        const token = String(params.assistToken || "");
+        if (!token) throw new Error("Missing assistToken");
+        const request = this.humanAssists.get(token);
+        if (!request) throw new Error("Human assist token is invalid.");
+
+        const sessionId = this.normalizeSessionId(params);
+        const owner = this.normalizeOwner(params);
+        if (request.sessionId !== sessionId || request.owner !== owner) {
+            throw new Error("Human assist token scope does not match session/owner.");
+        }
+        if (params.tabId !== undefined && request.tabId !== params.tabId) {
+            throw new Error("Human assist token scope does not match tabId.");
+        }
+
+        request.status = "confirmed";
+        request.confirmedAt = Date.now();
+        return request;
+    }
+
+    getHumanAssistStatus(params: SessionScopedParams & { assistToken?: string }) {
+        const token = String(params.assistToken || "");
+        if (!token) throw new Error("Missing assistToken");
+        const request = this.humanAssists.get(token);
+        if (!request) throw new Error("Human assist token is invalid.");
+
+        const sessionId = this.normalizeSessionId(params);
+        const owner = this.normalizeOwner(params);
+        if (request.sessionId !== sessionId || request.owner !== owner) {
+            throw new Error("Human assist token scope does not match session/owner.");
+        }
+        return request;
+    }
+
+    snapshot() {
+        return {
+            sessions: Array.from(this.sessions.values()).map(s => ({
+                id: s.id,
+                owner: s.owner,
+                name: s.name,
+                createdAt: s.createdAt,
+                updatedAt: s.updatedAt,
+                tabs: Array.from(s.tabs.values())
+            })),
+            tabs: Array.from(this.tabOwnership.values()),
+            humanAssists: Array.from(this.humanAssists.values()).map(a => ({
+                token: a.token,
+                type: a.type,
+                tabId: a.tabId,
+                sessionId: a.sessionId,
+                owner: a.owner,
+                message: a.message,
+                createdAt: a.createdAt,
+                confirmedAt: a.confirmedAt,
+                status: a.status
+            }))
+        };
+    }
+}
+
 // JSON-RPC 2.0 基础 Transport 类接口
 export interface Transport {
     sendMessage(message: any): void;
@@ -248,6 +514,7 @@ export class NativeRelayHandler {
     private extensionInstanceId: string = "";
     private router: JsonRpcRouter | null = null;
     private currentGroupName: string | null = null;
+    private coordinator = new SessionCoordinator();
 
     // 定义 RPC 方法的文档元数据
     public readonly _rpcMetadata: Record<string, { description: string, params?: string[] }> = {
@@ -256,7 +523,7 @@ export class NativeRelayHandler {
         getTabs: { description: "获取当前所有打开的标签页列表" },
         createTab: { 
             description: "创建一个新的浏览器标签页，并强制将其自动放入对应的标签分组中进行分类隔离", 
-            params: ["url: string (必填，默认 google.com)", "group: string (必填，自定义分组名称。若不传则自动关联当前会话名称进行分组)"] 
+            params: ["url: string (必填，默认 google.com)", "group: string (必填，自定义分组名称。若不传则自动关联当前会话名称进行分组)", "sessionId: string", "owner: string", "confirmToken: string (敏感操作必填)"] 
         },
         click: { 
             description: "根据 UID 点击页面元素（推荐使用，比坐标点击更精准）", 
@@ -358,6 +625,10 @@ export class NativeRelayHandler {
             description: "等待页面出现特定文字或 UID 元素。用于处理异步加载。",
             params: ["tabId: number", "text: string[] (可选，匹配任意一个即可)", "uid: string (可选)", "timeout: number (可选，默认 30000ms)"]
         },
+        readPage: {
+            description: "读取页面的紧凑文本语义树，并返回 UID/refMeta 供后续交互使用",
+            params: ["tabId: number", "filter: 'all'|'interactive' (默认 all)", "depth: number (默认 30)", "sessionId: string", "owner: string"]
+        },
         attach: { 
             description: "为指定标签页附加调试器（CDP）", 
             params: ["tabId: number"] 
@@ -379,16 +650,43 @@ export class NativeRelayHandler {
             params: ["tabId: number", "x: number", "y: number", "waitForArrival: boolean (可选)"] 
         },
         getUserHistory: { 
-            description: "搜索用户的浏览器历史记录", 
-            params: ["text: string (搜索关键词)", "maxResults: number (默认 100)"] 
+            description: "搜索用户的浏览器历史记录（敏感操作，需要一次性确认）", 
+            params: ["text: string (搜索关键词)", "maxResults: number (默认 100)", "sessionId: string", "owner: string", "confirmToken: string"] 
         },
         finalizeTabs: { 
-            description: "关闭除了指定 ID 以外的所有标签页", 
-            params: ["keep: number[] (需要保留的 ID 数组)"] 
+            description: "关闭除了指定 ID 以外的所有标签页（敏感操作，需要一次性确认）", 
+            params: ["keep: number[] (需要保留的 ID 数组)", "sessionId: string", "owner: string", "confirmToken: string"] 
         },
         nameSession: {
             description: "为当前自动化会话命名",
-            params: ["name: string"]
+            params: ["name: string", "sessionId: string", "owner: string"]
+        },
+        claimTab: {
+            description: "把现有标签页声明为当前 session/owner 独占，防止其他 Agent 干扰",
+            params: ["tabId: number", "sessionId: string", "owner: string"]
+        },
+        releaseTab: {
+            description: "释放当前 session/owner 对标签页的所有权（敏感操作，需要一次性确认）",
+            params: ["tabId: number", "sessionId: string", "owner: string", "confirmToken: string"]
+        },
+        getSessions: {
+            description: "查看当前 session、owner 与 tab 归属状态"
+        },
+        approveSensitiveOperation: {
+            description: "为敏感操作生成一次性确认 token，必须显式传入 approval: 'approve'",
+            params: ["method: string", "approval: 'approve'", "sessionId: string", "owner: string", "tabId: number (可选)", "reason: string (可选)"]
+        },
+        requestHumanAssist: {
+            description: "请求人工协助并返回当前页面截图；用于二维码登录、二次验证等需要人类接管的步骤",
+            params: ["tabId: number", "sessionId: string", "owner: string", "type: 'qr-login'|'mfa'|'manual'", "message: string (可选)", "fullPage: boolean (可选)"]
+        },
+        confirmHumanAssist: {
+            description: "用户完成扫码/二次验证后确认人工协助完成，Agent 随后应重试原业务步骤",
+            params: ["assistToken: string", "tabId: number", "sessionId: string", "owner: string"]
+        },
+        getHumanAssistStatus: {
+            description: "查询人工协助状态，确认后可继续重试原操作",
+            params: ["assistToken: string", "sessionId: string", "owner: string"]
         },
         turnEnded: {
             description: "通知系统当前操作轮次已结束",
@@ -427,130 +725,151 @@ export class NativeRelayHandler {
         };
     }
 
-    async attach(params: { tabId: number }) {
-        if (!params.tabId) throw new Error("Missing tabId");
-        await Agent.ensureDebuggerAttached(params.tabId);
-        return { attached: true };
+    private async runTabOperation<T>(params: SessionScopedParams, task: () => Promise<T> | T) {
+        this.coordinator.assertTabAccess(params.tabId!, params);
+        return await this.coordinator.runExclusive(params, task);
     }
 
-    async detach(params: { tabId: number }) {
+    private requireSensitive(method: string, params?: SessionScopedParams) {
+        this.coordinator.requireConfirmation(method, params);
+    }
+
+    async attach(params: SessionScopedParams) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return new Promise((resolve, reject) => {
+        return await this.runTabOperation(params, async () => {
+            await Agent.ensureDebuggerAttached(params.tabId);
+            return { attached: true };
+        });
+    }
+
+    async detach(params: SessionScopedParams) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await this.runTabOperation(params, () => new Promise((resolve, reject) => {
             chrome.debugger.detach({ tabId: params.tabId }, () => {
                 const err = chrome.runtime.lastError;
                 if (err && !err.message?.includes("not attached")) reject(err);
                 else resolve({ detached: true });
             });
-        });
+        }));
     }
 
-    async click(params: { tabId: number; uid: string; dblClick?: boolean }) {
+    async click(params: SessionScopedParams & { uid: string; dblClick?: boolean }) {
         if (!params.tabId || !params.uid) throw new Error("Missing tabId or uid");
-        return await Agent.click(params.tabId, params.uid, { dblClick: params.dblClick });
+        return await this.runTabOperation(params, () => Agent.click(params.tabId, params.uid, { dblClick: params.dblClick }));
     }
 
-    async fillForm(params: { tabId: number; elements: { uid: string; value: string }[] }) {
+    async fillForm(params: SessionScopedParams & { elements: { uid: string; value: string }[] }) {
         if (!params.tabId || !params.elements) throw new Error("Missing tabId or elements");
-        return await Agent.fillForm(params.tabId, params.elements);
+        return await this.runTabOperation(params, () => Agent.fillForm(params.tabId, params.elements));
     }
 
-    async emulateDevice(params: { tabId: number; profile: 'iphone' | 'android' | 'googlebot' | 'desktop' }) {
+    async emulateDevice(params: SessionScopedParams & { profile: 'iphone' | 'android' | 'googlebot' | 'desktop' }) {
         if (!params.tabId || !params.profile) throw new Error("Missing tabId or profile");
-        return await Agent.emulateDevice(params.tabId, params.profile);
+        this.requireSensitive("emulateDevice", params);
+        return await this.runTabOperation(params, () => Agent.emulateDevice(params.tabId, params.profile));
     }
 
-    async resizePage(params: { tabId: number; width: number; height: number }) {
+    async resizePage(params: SessionScopedParams & { width: number; height: number }) {
         if (!params.tabId || !params.width || !params.height) throw new Error("Missing params");
-        return await Agent.resizePage(params.tabId, params.width, params.height);
+        return await this.runTabOperation(params, () => Agent.resizePage(params.tabId, params.width, params.height));
     }
 
-    async listNetworkRequests(params: { tabId: number }) {
+    async listNetworkRequests(params: SessionScopedParams) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.listNetworkRequests(params.tabId);
+        return await this.runTabOperation(params, () => Agent.listNetworkRequests(params.tabId));
     }
 
-    async getCookies(params: { tabId: number }) {
+    async getCookies(params: SessionScopedParams) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.getCookies(params.tabId);
+        this.requireSensitive("getCookies", params);
+        return await this.runTabOperation(params, () => Agent.getCookies(params.tabId));
     }
 
-    async pressKey(params: { tabId: number; key: string }) {
+    async pressKey(params: SessionScopedParams & { key: string }) {
         if (!params.tabId || !params.key) throw new Error("Missing tabId or key");
-        return await Agent.pressKey(params.tabId, params.key);
+        return await this.runTabOperation(params, () => Agent.pressKey(params.tabId, params.key));
     }
 
-    async navigatePage(params: { tabId: number; type: 'back' | 'forward' | 'reload' }) {
+    async navigatePage(params: SessionScopedParams & { type: 'back' | 'forward' | 'reload' }) {
         if (!params.tabId || !params.type) throw new Error("Missing tabId or type");
-        return await Agent.navigatePage(params.tabId, params.type);
+        return await this.runTabOperation(params, () => Agent.navigatePage(params.tabId, params.type));
     }
 
-    async hover(params: { tabId: number; uid: string }) {
+    async hover(params: SessionScopedParams & { uid: string }) {
         if (!params.tabId || !params.uid) throw new Error("Missing tabId or uid");
-        return await Agent.hover(params.tabId, params.uid);
+        return await this.runTabOperation(params, () => Agent.hover(params.tabId, params.uid));
     }
 
-    async listConsoleMessages(params: { tabId: number }) {
+    async listConsoleMessages(params: SessionScopedParams) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.listConsoleMessages(params.tabId);
+        return await this.runTabOperation(params, () => Agent.listConsoleMessages(params.tabId));
     }
 
-    async evaluateScript(params: { tabId: number; script: string }) {
+    async evaluateScript(params: SessionScopedParams & { script: string }) {
         if (!params.tabId || !params.script) throw new Error("Missing tabId or script");
-        return await Agent.evaluateScript(params.tabId, params.script);
+        return await this.runTabOperation(params, () => Agent.evaluateScript(params.tabId, params.script));
     }
 
-    async drag(params: { tabId: number; fromUid: string; toUid: string }) {
+    async drag(params: SessionScopedParams & { fromUid: string; toUid: string }) {
         if (!params.tabId || !params.fromUid || !params.toUid) throw new Error("Missing params");
-        return await Agent.drag(params.tabId, params.fromUid, params.toUid);
+        return await this.runTabOperation(params, () => Agent.drag(params.tabId, params.fromUid, params.toUid));
     }
 
-    async uploadFile(params: { tabId: number; uid: string; filePath: string }) {
+    async uploadFile(params: SessionScopedParams & { uid: string; filePath: string }) {
         if (!params.tabId || !params.uid || !params.filePath) throw new Error("Missing params");
-        return await Agent.uploadFile(params.tabId, params.uid, params.filePath);
+        return await this.runTabOperation(params, () => Agent.uploadFile(params.tabId, params.uid, params.filePath));
     }
 
-    async clickAt(params: { tabId: number; x: number; y: number }) {
+    async clickAt(params: SessionScopedParams & { x: number; y: number }) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.clickAt(params.tabId, params.x, params.y);
+        return await this.runTabOperation(params, () => Agent.clickAt(params.tabId, params.x, params.y));
     }
 
-    async selectPage(params: { tabId: number }) {
+    async selectPage(params: SessionScopedParams) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.selectPage(params.tabId);
+        return await this.runTabOperation(params, () => Agent.selectPage(params.tabId));
     }
 
-    async closePage(params: { tabId: number }) {
+    async closePage(params: SessionScopedParams) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.closePage(params.tabId);
-    }
-
-    async typeText(params: { tabId: number; text: string }) {
-        if (!params.tabId || !params.text) throw new Error("Missing params");
-        return await Agent.typeText(params.tabId, params.text);
-    }
-
-    async handleDialog(params: { tabId: number; action: 'accept' | 'dismiss'; promptText?: string }) {
-        if (!params.tabId || !params.action) throw new Error("Missing params");
-        return await Agent.handleDialog(params.tabId, params.action, params.promptText);
-    }
-
-    async getNetworkResponseBody(params: { tabId: number; requestId: string }) {
-        if (!params.tabId || !params.requestId) throw new Error("Missing params");
-        return await Agent.getNetworkResponseBody(params.tabId, params.requestId);
-    }
-
-    async takeHeapSnapshot(params: { tabId: number; filePath: string }) {
-        if (!params.tabId || !params.filePath) throw new Error("Missing params");
-        
-        // 这是一个流式操作。我们需要通过 Notification 通知 Host 开启文件写入
-        this.router?.sendNotification("onStartHeapSnapshot", { filePath: params.filePath });
-        
-        const result = await Agent.takeHeapSnapshot(params.tabId, (chunk: string) => {
-            this.router?.sendNotification("onHeapSnapshotChunk", { chunk });
+        this.requireSensitive("closePage", params);
+        return await this.runTabOperation(params, async () => {
+            const result = await Agent.closePage(params.tabId);
+            this.coordinator.releaseTab(params.tabId!);
+            return result;
         });
+    }
 
-        this.router?.sendNotification("onEndHeapSnapshot", { filePath: params.filePath });
-        return result;
+    async typeText(params: SessionScopedParams & { text: string }) {
+        if (!params.tabId || !params.text) throw new Error("Missing params");
+        return await this.runTabOperation(params, () => Agent.typeText(params.tabId, params.text));
+    }
+
+    async handleDialog(params: SessionScopedParams & { action: 'accept' | 'dismiss'; promptText?: string }) {
+        if (!params.tabId || !params.action) throw new Error("Missing params");
+        return await this.runTabOperation(params, () => Agent.handleDialog(params.tabId, params.action, params.promptText));
+    }
+
+    async getNetworkResponseBody(params: SessionScopedParams & { requestId: string }) {
+        if (!params.tabId || !params.requestId) throw new Error("Missing params");
+        return await this.runTabOperation(params, () => Agent.getNetworkResponseBody(params.tabId, params.requestId));
+    }
+
+    async takeHeapSnapshot(params: SessionScopedParams & { filePath: string }) {
+        if (!params.tabId || !params.filePath) throw new Error("Missing params");
+        this.requireSensitive("takeHeapSnapshot", params);
+        return await this.runTabOperation(params, async () => {
+        
+            // 这是一个流式操作。我们需要通过 Notification 通知 Host 开启文件写入
+            this.router?.sendNotification("onStartHeapSnapshot", { filePath: params.filePath });
+        
+            const result = await Agent.takeHeapSnapshot(params.tabId, (chunk: string) => {
+                this.router?.sendNotification("onHeapSnapshotChunk", { chunk });
+            });
+
+            this.router?.sendNotification("onEndHeapSnapshot", { filePath: params.filePath });
+            return result;
+        });
     }
 
     async getHeapSnapshotSummary(params: { filePath: string }) {
@@ -574,14 +893,20 @@ export class NativeRelayHandler {
         return await this.router.sendRequest("host.getHeapSnapshotRetainers", params);
     }
 
-    async waitFor(params: { tabId: number; text?: string[]; uid?: string; timeout?: number }) {
+    async waitFor(params: SessionScopedParams & { text?: string[]; uid?: string; timeout?: number }) {
         if (!params.tabId) throw new Error("Missing tabId");
-        return await Agent.waitFor(params.tabId, { text: params.text, uid: params.uid, timeout: params.timeout });
+        return await this.runTabOperation(params, () => Agent.waitFor(params.tabId, { text: params.text, uid: params.uid, timeout: params.timeout }));
     }
 
-    async executeCdp(params: { tabId: number; method: string; params: any }) {
+    async readPage(params: SessionScopedParams & { filter?: string; depth?: number }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await this.runTabOperation(params, () => Agent.readPage(params.tabId, params.filter || "all", params.depth || 30));
+    }
+
+    async executeCdp(params: SessionScopedParams & { method: string; params: any }) {
         if (!params.tabId || !params.method) throw new Error("Missing tabId or method");
-        return await Agent.sendCDP(params.tabId, params.method, params.params || {});
+        this.requireSensitive("executeCdp", params);
+        return await this.runTabOperation(params, () => Agent.sendCDP(params.tabId, params.method, params.params || {}));
     }
 
     async getTabs() {
@@ -595,7 +920,8 @@ export class NativeRelayHandler {
         }));
     }
 
-    async getUserHistory(params: { text?: string; maxResults?: number }) {
+    async getUserHistory(params: SessionScopedParams & { text?: string; maxResults?: number }) {
+        this.requireSensitive("getUserHistory", params);
         return new Promise((resolve) => {
             chrome.history.search({
                 text: params.text || "",
@@ -606,46 +932,133 @@ export class NativeRelayHandler {
         });
     }
 
-    async createTab(params?: { url?: string; group?: string }) {
+    async createTab(params?: SessionScopedParams & { url?: string; group?: string }) {
+        this.requireSensitive("createTab", params);
+        const session = this.coordinator.ensureSession(params);
         const url = params?.url || "https://www.google.com";
-        const groupName = params?.group || this.currentGroupName || "CLI Session";
-        const tab = await Agent.createTab(url, groupName);
-        return { id: tab.id, url: tab.url };
-    }
-
-    async finalizeTabs(params: { keep: number[] }) {
-        if (!params || !Array.isArray(params.keep)) throw new Error("finalizeTabs requires a keep array");
-        const tabs = await chrome.tabs.query({});
-        const closeTabs = tabs.filter(t => t.id && !params.keep.includes(t.id));
-        for (const t of closeTabs) {
-            if (t.id) await chrome.tabs.remove(t.id);
-        }
-        return { success: true };
-    }
-
-    async takeScreenshot(params: { tabId: number; format?: string; quality?: number; fullPage?: boolean }) {
-        if (!params.tabId) throw new Error("Missing tabId");
-        
-        if (params.fullPage) {
-            return await Agent.takeFullPageScreenshot(params.tabId, params);
-        }
-
-        // CDP screenshot is more powerful
-        const result = await Agent.sendCDP(params.tabId, "Page.captureScreenshot", {
-            format: params.format || "png",
-            quality: params.quality || 80,
-            fromSurface: true
+        const groupName = params?.group || this.currentGroupName || session.name || session.id || "CLI Session";
+        return await this.coordinator.runExclusive(params, async () => {
+            const tab = await Agent.createTab(url, groupName);
+            if (tab.id) this.coordinator.claimTab(tab.id, params);
+            return { id: tab.id, url: tab.url, sessionId: session.id, owner: session.owner };
         });
-        return result;
     }
 
-    async nameSession(params: { name: string }) {
+    async finalizeTabs(params: SessionScopedParams & { keep: number[] }) {
+        if (!params || !Array.isArray(params.keep)) throw new Error("finalizeTabs requires a keep array");
+        this.requireSensitive("finalizeTabs", params);
+        return await this.coordinator.runExclusive(params, async () => {
+            const tabs = await chrome.tabs.query({});
+            const closeTabs = tabs.filter(t => t.id && !params.keep.includes(t.id));
+            for (const t of closeTabs) {
+                if (t.id) {
+                    this.coordinator.assertTabAccess(t.id, params);
+                    await chrome.tabs.remove(t.id);
+                    this.coordinator.releaseTab(t.id);
+                }
+            }
+            return { success: true };
+        });
+    }
+
+    async takeScreenshot(params: SessionScopedParams & { format?: string; quality?: number; fullPage?: boolean }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await this.runTabOperation(params, async () => {
+        
+            if (params.fullPage) {
+                return await Agent.takeFullPageScreenshot(params.tabId, params);
+            }
+
+            // CDP screenshot is more powerful
+            const result = await Agent.sendCDP(params.tabId, "Page.captureScreenshot", {
+                format: params.format || "png",
+                quality: params.quality || 80,
+                fromSurface: true
+            });
+            return result;
+        });
+    }
+
+    async nameSession(params: SessionScopedParams & { name: string }) {
+        const session = this.coordinator.nameSession(params);
         this.currentGroupName = params.name || null;
-        return { success: true, name: params.name };
+        return { success: true, name: params.name, sessionId: session.id, owner: session.owner };
     }
 
     async turnEnded(params: any) {
         return { success: true };
+    }
+
+    async claimTab(params: SessionScopedParams) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        this.coordinator.claimTab(params.tabId, params);
+        return { success: true, tabId: params.tabId, sessionId: this.coordinator.normalizeSessionId(params), owner: this.coordinator.normalizeOwner(params) };
+    }
+
+    async releaseTab(params: SessionScopedParams) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        this.requireSensitive("releaseTab", params);
+        this.coordinator.assertTabAccess(params.tabId, params);
+        this.coordinator.releaseTab(params.tabId);
+        return { success: true, tabId: params.tabId };
+    }
+
+    async getSessions() {
+        return this.coordinator.snapshot();
+    }
+
+    async approveSensitiveOperation(params: SessionScopedParams & { method?: string; approval?: string; reason?: string }) {
+        return this.coordinator.approveSensitiveOperation(params);
+    }
+
+    async requestHumanAssist(params: SessionScopedParams & { type?: string; message?: string; fullPage?: boolean }) {
+        if (!params.tabId) throw new Error("Missing tabId");
+        return await this.runTabOperation(params, async () => {
+            const request = this.coordinator.createHumanAssist(params);
+            const screenshot = params.fullPage
+                ? await Agent.takeFullPageScreenshot(params.tabId, { format: "png" })
+                : await Agent.sendCDP(params.tabId, "Page.captureScreenshot", { format: "png", fromSurface: true });
+            const imageBase64 = screenshot?.data || "";
+            const imageDataUrl = imageBase64 ? `data:image/png;base64,${imageBase64}` : "";
+            return {
+                assistToken: request.token,
+                status: request.status,
+                type: request.type,
+                message: request.message,
+                tabId: request.tabId,
+                sessionId: request.sessionId,
+                owner: request.owner,
+                imageBase64,
+                imageDataUrl,
+                markdownImage: imageDataUrl ? `![Human assist screenshot](${imageDataUrl})` : "",
+                screenshot
+            };
+        });
+    }
+
+    async confirmHumanAssist(params: SessionScopedParams & { assistToken?: string }) {
+        const request = this.coordinator.confirmHumanAssist(params);
+        return {
+            success: true,
+            assistToken: request.token,
+            status: request.status,
+            confirmedAt: request.confirmedAt,
+            retry: true
+        };
+    }
+
+    async getHumanAssistStatus(params: SessionScopedParams & { assistToken?: string }) {
+        const request = this.coordinator.getHumanAssistStatus(params);
+        return {
+            assistToken: request.token,
+            status: request.status,
+            type: request.type,
+            tabId: request.tabId,
+            sessionId: request.sessionId,
+            owner: request.owner,
+            confirmedAt: request.confirmedAt,
+            retry: request.status === "confirmed"
+        };
     }
 
     async restartRelay() {
@@ -655,25 +1068,31 @@ export class NativeRelayHandler {
         return { success: true, message: "Relay restart initiated" };
     }
 
-    async moveMouse(params: { tabId: number; x: number; y: number; waitForArrival?: boolean; session_id?: string; turn_id?: string }) {
+    releaseClosedTab(tabId: number) {
+        this.coordinator.releaseTab(tabId);
+    }
+
+    async moveMouse(params: SessionScopedParams & { x: number; y: number; waitForArrival?: boolean; turn_id?: string }) {
         if (!params.tabId) throw new Error("Missing tabId");
+        return await this.runTabOperation(params, async () => {
         
-        try {
-            await chrome.tabs.sendMessage(params.tabId, {
-                type: "MOVE_MOUSE",
-                x: params.x,
-                y: params.y,
-                waitForArrival: params.waitForArrival !== false
-            });
-        } catch (e) {
-            // 退化到直接使用 CDP 事件注入
-            await Agent.sendCDP(params.tabId, "Input.dispatchMouseEvent", {
-                type: "mouseMoved",
-                x: params.x,
-                y: params.y
-            });
-        }
-        return { success: true };
+            try {
+                await chrome.tabs.sendMessage(params.tabId, {
+                    type: "MOVE_MOUSE",
+                    x: params.x,
+                    y: params.y,
+                    waitForArrival: params.waitForArrival !== false
+                });
+            } catch (e) {
+                // 退化到直接使用 CDP 事件注入
+                await Agent.sendCDP(params.tabId, "Input.dispatchMouseEvent", {
+                    type: "mouseMoved",
+                    x: params.x,
+                    y: params.y
+                });
+            }
+            return { success: true };
+        });
     }
 }
 
@@ -698,6 +1117,10 @@ export class NativeRelayExtension extends JsonRpcRouter {
         };
 
         this.registerRequestHandlerObject(handler);
+
+        chrome.tabs.onRemoved.addListener((tabId) => {
+            handler.releaseClosedTab(tabId);
+        });
 
         // 监听下载事件并推送
         chrome.downloads.onCreated.addListener((downloadItem) => {

@@ -56,6 +56,64 @@ Native Host 是实现 Agent 与 Chrome 安全通信的关键组件。
 - **Windows**: 运行 `host/install.bat`
 - **macOS/Linux**: 运行 `host/install.sh`
 
+### 3. 启动指定指纹浏览器并自动加载插件
+隐私模式依赖 [CloakBrowser](https://github.com/CloakHQ/CloakBrowser)。使用隐私模式前必须先安装 CloakBrowser 的 Python 或 Node CLI；未安装 CloakBrowser 时不要使用隐私模式。
+
+安装方式任选其一：
+
+```bash
+npm install -g cloakbrowser
+```
+
+或：
+
+```bash
+pip install cloakbrowser
+```
+
+安装后可以用 `--cloakbrowser` 启动独立浏览器配置，并自动加载本项目插件：
+
+```bash
+node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --cloakbrowser --profile .browser-profiles/xhs --url https://www.xiaohongshu.com --wait-bridge-port
+```
+
+如果你的其他指纹浏览器兼容 Chromium 启动参数，也可以手动指定浏览器可执行文件：
+
+```bash
+node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --browser "C:\\Path\\To\\FingerprintBrowser.exe" --profile .browser-profiles/xhs --url https://www.xiaohongshu.com
+```
+
+如果希望脚本在浏览器启动后等待并输出插件桥接端口：
+
+```bash
+node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --browser "C:\\Path\\To\\FingerprintBrowser.exe" --profile .browser-profiles/xhs --wait-bridge-port
+```
+
+如果使用 CloakBrowser，脚本会自动解析 CloakBrowser 下载的 Chromium 可执行文件：
+
+```bash
+node skills/browser-remote-control/scripts/launch-fingerprint-browser.js --cloakbrowser --profile .browser-profiles/xhs --url https://www.xiaohongshu.com --wait-bridge-port
+```
+
+常用参数：
+- `--browser`：浏览器可执行文件路径，必填。
+- `--cloakbrowser`：自动从 CloakBrowser CLI 解析 Chromium 可执行文件路径，使用该参数时无需传 `--browser`。
+- `--cloakbrowser-cli`：指定 CloakBrowser CLI 命令，默认自动尝试 `npx cloakbrowser`、`python -m cloakbrowser`、`python3 -m cloakbrowser`。
+- `--profile`：独立用户数据目录，默认 `.browser-profiles/default`。
+- `--extension`：要加载的插件目录，默认 `dist`。
+- 独立 skill 场景下，如果找不到项目根目录的 `dist`，脚本会自动解压 `skills/browser-remote-control/assets/bridge-extension.zip` 作为插件目录。
+- `--extra-extension`：额外插件目录，可重复传入。
+- `--proxy-server`：代理地址，例如 `http://127.0.0.1:7890`。
+- `--remote-debugging-port`：打开 CDP 端口，例如 `9222`。
+- `--arg`：传递额外浏览器参数，可重复传入。
+- `--wait-bridge-port`：启动后等待插件 Native Host 就绪，并输出桥接端口。
+- `--bridge-start-port`：桥接端口扫描起点，默认读取 `host/config.json` 或使用 `9333`。
+- `--bridge-scan-count`：扫描端口数量，默认 `50`。
+- `--bridge-token`：桥接认证 Token，默认读取 `host/config.json`、`SEO_TOKEN` 或内置默认值。
+- `--bridge-timeout`：等待桥接端口超时时间，默认 `30000` 毫秒。
+
+> 注意：脚本通过 `--load-extension` 加载插件。部分商业指纹浏览器会屏蔽或改写 Chromium 参数，这种情况下需要改用该浏览器官方的启动/API 方式。
+
 ## 🤖 在 AI Agent 中使用
 
 本项目不仅是物理层面的中继，还为各种主流 AI Agent 提供了开箱即用的“浏览器操控技能”。通过本项目，你可以让你的 Agent 具备真正的执行力：
