@@ -8,9 +8,14 @@
     "type-check": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/chrome": "^0.0.268",
     "fs-extra": "^11.3.4",
     "glob": "^13.0.6",
-    "typescript": "^5.0.0",
-    "@types/chrome": "^0.0.268"
+    "javascript-obfuscator": "^5.4.1",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "cloakbrowser": "^0.4.7",
+    "playwright-core": "^1.61.1"
   }
 }
