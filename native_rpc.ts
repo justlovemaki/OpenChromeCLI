@@ -582,6 +582,10 @@ export class NativeRelayHandler {
             description: "点击屏幕上的精确坐标位置。",
             params: ["tabId: number", "x: number", "y: number"]
         },
+        clickVisibleText: {
+            description: "在指定网址中，按可见元素的准确文字和角色点击。使用静态脚本，不执行动态代码。匹配不唯一时拒绝点击。",
+            params: ["tabId: number", "expectedUrl: string", "text: string", "role: 'button'|'tab'|'link'"]
+        },
         selectPage: {
             description: "激活并置顶显示指定的标签页。",
             params: ["tabId: number"]
@@ -854,6 +858,38 @@ export class NativeRelayHandler {
     async clickAt(params: SessionScopedParams & { x: number; y: number }) {
         if (!params.tabId) throw new Error("Missing tabId");
         return await this.runTabOperation(params, () => Agent.clickAt(params.tabId, params.x, params.y));
+    }
+
+    async clickVisibleText(params: SessionScopedParams & { expectedUrl: string; text: string; role: string }) {
+        if (!params.tabId || !params.expectedUrl || !params.text || !['button', 'tab', 'link'].includes(params.role)) {
+            throw new Error("Missing or invalid visible-element target");
+        }
+        const tab = await chrome.tabs.get(params.tabId);
+        if (tab.url !== params.expectedUrl || !/^https?:\/\//i.test(tab.url || '')) {
+            throw new Error("Current page does not match the expected website");
+        }
+        const results = await Agent.executeScript(params.tabId, {
+            func: (text: string, role: string, expectedUrl: string) => {
+                if (location.href !== expectedUrl) throw new Error("Page changed before interaction");
+                const normalize = (s: string) => (s || '').replace(/\s+/g, ' ').trim();
+                const selector = role === 'button' ? 'button,[role="button"]'
+                    : role === 'link' ? 'a[href],[role="link"]' : '[role="tab"]';
+                const matches = Array.from(document.querySelectorAll<HTMLElement>(selector)).filter(el => {
+                    const style = getComputedStyle(el);
+                    return el.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none'
+                        && [el.getAttribute('aria-label'), el.innerText].some(value => normalize(value || '') === normalize(text));
+                });
+                if (matches.length !== 1) throw new Error(`Expected one visible element, found ${matches.length}`);
+                const element = matches[0];
+                if (element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') {
+                    throw new Error("Target element is disabled");
+                }
+                element.click();
+                return { success: true, method: 'static-visible-element', text, role };
+            },
+            args: [params.text, params.role, params.expectedUrl]
+        });
+        return results?.[0]?.result;
     }
 
     async selectPage(params: SessionScopedParams) {
